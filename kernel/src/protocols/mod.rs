@@ -8,6 +8,8 @@ pub mod apic;
 pub mod attest;
 pub mod core;
 pub mod errors;
+#[cfg(feature = "parttest")]
+pub mod parttest;
 #[cfg(feature = "uefivars")]
 pub mod uefivars;
 #[cfg(feature = "vtpm")]
@@ -21,6 +23,11 @@ pub const SVSM_ATTEST_PROTOCOL: u32 = 1;
 pub const SVSM_VTPM_PROTOCOL: u32 = 2;
 pub const SVSM_APIC_PROTOCOL: u32 = 3;
 pub const SVSM_UEFI_MM_PROTOCOL: u32 = 4;
+/// Partition-isolation test protocol (F0X-78 idea B). Deliberately far from the
+/// assigned range so it cannot collide with an upstream protocol id. Behind the
+/// `parttest` feature and never present in a shipping build.
+#[cfg(feature = "parttest")]
+pub const SVSM_PARTTEST_PROTOCOL: u32 = 0xF000;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RequestParams {
