@@ -44,6 +44,12 @@ use crate::utils::MemoryRegion;
 const SVSM_REQ_PARTTEST_REVOKE_WRITE: u32 = 0;
 /// Restore read/write/execute for the guest VMPL on one 4K page.
 const SVSM_REQ_PARTTEST_GRANT_WRITE: u32 = 1;
+/// Do nothing and return success. Times the guest -> VMGEXIT -> hypervisor ->
+/// VMPL0 -> back round trip with no work inside it, which is the relay cost any
+/// hypervisor-mediated partition switch has to pay (F0X-93 vmsa_reentry). VEIL
+/// reports 7,135 cycles for a relayed domain switch and NestedSGX 32-34k, so
+/// this is the term to compare against those.
+const SVSM_REQ_PARTTEST_NOOP: u32 = 2;
 
 pub const PARTTEST_PROTOCOL_VERSION_MIN: u32 = 1;
 pub const PARTTEST_PROTOCOL_VERSION_MAX: u32 = 1;
@@ -89,6 +95,7 @@ pub fn parttest_protocol_request(
         SVSM_REQ_PARTTEST_GRANT_WRITE => {
             adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::RWX)
         }
+        SVSM_REQ_PARTTEST_NOOP => Ok(()),
         _ => Err(SvsmReqError::unsupported_call()),
     }
 }
