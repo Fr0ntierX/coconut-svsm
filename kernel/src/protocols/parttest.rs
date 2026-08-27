@@ -50,6 +50,12 @@ const SVSM_REQ_PARTTEST_GRANT_WRITE: u32 = 1;
 /// reports 7,135 cycles for a relayed domain switch and NestedSGX 32-34k, so
 /// this is the term to compare against those.
 const SVSM_REQ_PARTTEST_NOOP: u32 = 2;
+/// Drop every permission for the guest VMPL on one 4K page, read included.
+/// REVOKE_WRITE keeps read because B runs read-only: page tables must stay
+/// readable for the hardware walker at the partition's VMPL. This exists only
+/// to tell whether the wedged-vCPU behaviour is specific to read-only or is
+/// general to any RMP permission violation (F0X-301, experiment 2).
+const SVSM_REQ_PARTTEST_REVOKE_ALL: u32 = 3;
 
 pub const PARTTEST_PROTOCOL_VERSION_MIN: u32 = 1;
 pub const PARTTEST_PROTOCOL_VERSION_MAX: u32 = 1;
@@ -94,6 +100,9 @@ pub fn parttest_protocol_request(
         }
         SVSM_REQ_PARTTEST_GRANT_WRITE => {
             adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::RWX)
+        }
+        SVSM_REQ_PARTTEST_REVOKE_ALL => {
+            adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::NONE)
         }
         SVSM_REQ_PARTTEST_NOOP => Ok(()),
         _ => Err(SvsmReqError::unsupported_call()),
