@@ -214,6 +214,12 @@ $(LIBPLATFORM): $(TCGTPM_MAKEFILE) $(LIBCRYPTO)
 	$(MAKE) -C $(TCGTPM_BUILD_DIR) $(LIBPLATFORM_TARGET)
 
 TCGTPM_CFLAGS += -fPIE
+# Reproducible builds: __FILE__ and debug info otherwise carry the builder's
+# absolute source and output paths into the SVSM binary (see the top-level
+# Makefile for the Rust side of the same fix).
+PREFIX_MAP_CFLAGS := -ffile-prefix-map=$(ROOT_DIR)=/libtcgtpm/ -ffile-prefix-map=$(OUT_DIR)=/libtcgtpm-out
+TCGTPM_CFLAGS += $(PREFIX_MAP_CFLAGS)
+OPENSSL_CFLAGS += $(PREFIX_MAP_CFLAGS)
 TCGTPM_CFLAGS += -DFILE_BACKED_NV=YES -DVTPM=YES
 TCGTPM_CFLAGS += $(LIBCRT_INCLUDE)
 TCGTPM_CFLAGS += -I$(OPENSSL_BUILD_DIR)/include
