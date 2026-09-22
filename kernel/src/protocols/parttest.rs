@@ -84,8 +84,16 @@ fn adjust_guest_page(params: &RequestParams, flags: RMPFlags) -> Result<(), Svsm
     // and the flags only ever narrow or restore the guest VMPL's own access to
     // it. Nothing here touches SVSM-private mappings, so it cannot affect
     // memory safety on this side.
+    // The RMPADJUST status code is kept in the log line rather than folded
+    // into the protocol error, which has no field for it. A failed lab run
+    // otherwise says only "invalid request" when the interesting part is
+    // whether the instruction returned FAIL_PERMISSION, FAIL_SIZEMISMATCH or
+    // FAIL_INUSE.
     unsafe { rmp_adjust(vaddr, flags, PageSize::Regular) }.map_err(|e| match e {
-        SvsmError::SevSnp(_) => SvsmReqError::invalid_request(),
+        SvsmError::SevSnp(code) => {
+            log::info!("parttest: RMPADJUST failed on {paddr:#x}, status {code:?}");
+            SvsmReqError::invalid_request()
+        }
         other => other.into(),
     })
 }
@@ -95,6 +103,12 @@ pub fn parttest_protocol_request(
     params: &mut RequestParams,
 ) -> Result<(), SvsmReqError> {
     match request {
+        // These touch GUEST_VMPL alone, where upstream's
+        // rmp_revoke_guest_access sweeps GUEST_VMPL through VMPL3. Deliberate:
+        // the test is about what the partition's own VMPL can reach, and
+        // narrowing one level is what idea B does on a switch. Sweeping the
+        // rest would also revoke levels the test never granted, which would
+        // make a failure harder to attribute rather than easier.
         SVSM_REQ_PARTTEST_REVOKE_WRITE => {
             adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::READ)
         }

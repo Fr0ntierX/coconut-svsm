@@ -217,7 +217,7 @@ TCGTPM_CFLAGS += -fPIE
 # Reproducible builds: __FILE__ and debug info otherwise carry the builder's
 # absolute source and output paths into the SVSM binary (see the top-level
 # Makefile for the Rust side of the same fix).
-PREFIX_MAP_CFLAGS := -ffile-prefix-map=$(ROOT_DIR)=/libtcgtpm/ -ffile-prefix-map=$(OUT_DIR)=/libtcgtpm-out
+PREFIX_MAP_CFLAGS := -ffile-prefix-map=$(ROOT_DIR)=/libtcgtpm -ffile-prefix-map=$(OUT_DIR)=/libtcgtpm-out
 TCGTPM_CFLAGS += $(PREFIX_MAP_CFLAGS)
 OPENSSL_CFLAGS += $(PREFIX_MAP_CFLAGS)
 TCGTPM_CFLAGS += -DFILE_BACKED_NV=YES -DVTPM=YES
