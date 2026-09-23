@@ -41,6 +41,19 @@ ifdef OFFLINE
 CARGO_ARGS += --locked --offline
 endif
 
+# Reproducible builds: strip the builder's checkout and cargo home from every
+# path rustc embeds (panic locations, file!(), debug info), so two people
+# building the same commit at different paths get byte-identical binaries and
+# the same launch measurement. Passed with --config rather than RUSTFLAGS on
+# purpose: RUSTFLAGS and CARGO_TARGET_*_RUSTFLAGS replace the target rustflags
+# in .cargo/config.toml, which silently drops the aes_force_soft cfgs and
+# breaks the x86_64-unknown-none build with an LLVM error that looks nothing
+# like a flags problem. --config merges arrays with the config file instead.
+# The same prefixes are handed to the C side via libtcgtpm/Makefile.
+CARGO_HOME ?= $(HOME)/.cargo
+REMAP_RUSTFLAGS := ["--remap-path-prefix=$(CURDIR)=/svsm","--remap-path-prefix=$(CARGO_HOME)=/cargo"]
+CARGO_ARGS += --config 'target.x86_64-unknown-none.rustflags=$(REMAP_RUSTFLAGS)'
+
 ifeq ($(V), 1)
 CARGO_ARGS += -v
 else ifeq ($(V), 2)

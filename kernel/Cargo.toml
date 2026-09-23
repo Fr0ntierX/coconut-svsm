@@ -99,6 +99,10 @@ default = []
 persistence = ["dep:cocoon-tpm-storage", "block", "virtio-drivers", "attest"]
 enable-gdb = ["dep:gdbstub", "dep:gdbstub_arch"]
 vtpm = ["dep:libtcgtpm"]
+# Partition-isolation test protocol (F0X-78 idea B). Exposes an SVSM call that
+# lets the guest ask for write to be revoked on its own page, which is a test
+# surface, not a product one. Never enable in a shipping build.
+parttest = []
 nosmep = []
 nosmap = []
 verus_all = [
