@@ -58,7 +58,11 @@ pub const CORE_PROTOCOL_VERSION_MAX: u32 = 1;
 //
 // The PValidate path will take the lock for read, the create_vcpu path takes
 // the lock for write.
-static PVALIDATE_LOCK: RWLock<()> = RWLock::new(());
+//
+// Anything else in the kernel that changes a guest page's RMP permissions
+// races these paths the same way, so it takes the lock for write too. That is
+// why it is visible to the rest of the crate.
+pub(crate) static PVALIDATE_LOCK: RWLock<()> = RWLock::new(());
 
 #[repr(C, packed)]
 #[derive(Copy, Clone, FromBytes, IntoBytes)]
