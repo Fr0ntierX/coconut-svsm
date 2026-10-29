@@ -75,6 +75,25 @@ fn run_cmd_checked<C: BorrowMut<Command>>(mut cmd: C, args: &Args) -> BuildResul
     Err(std::io::Error::last_os_error().into())
 }
 
+/// The `--config` value that strips the checkout and cargo home from every
+/// path rustc embeds in a bare-metal build, the same remap the Makefile gives
+/// its own cargo invocations (see REMAP_RUSTFLAGS there). Without it the
+/// kernel inside the IGVM carries the builder's absolute paths, so two
+/// checkouts of one commit measure differently. Passed with --config rather
+/// than RUSTFLAGS because --config merges with the target rustflags in
+/// .cargo/config.toml, where RUSTFLAGS would replace them.
+fn remap_config() -> Option<String> {
+    let root = std::env::current_dir().ok()?;
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))?;
+    Some(format!(
+        "target.x86_64-unknown-none.rustflags=[\"--remap-path-prefix={}=/svsm\",\"--remap-path-prefix={}=/cargo\"]",
+        root.display(),
+        cargo_home.display()
+    ))
+}
+
 /// Build targets for cargo
 #[derive(Clone, Copy, Debug)]
 enum BuildTarget {
@@ -226,6 +245,11 @@ impl ComponentConfig {
             cmd.args(["--target", triple]);
             bin.push(triple);
         };
+        if matches!(target, BuildTarget::X8664UnknownNone) {
+            if let Some(remap) = remap_config() {
+                cmd.args(["--config", &remap]);
+            }
+        }
         self.apply_features(&mut cmd, args, pkg, cmd_feats);
         if let Some(manifest) = self.manifest.as_ref() {
             cmd.args(["--manifest-path".as_ref(), manifest.as_os_str()]);
