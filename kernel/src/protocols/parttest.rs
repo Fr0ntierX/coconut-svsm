@@ -35,6 +35,7 @@ use crate::address::{Address, PhysAddr};
 use crate::error::SvsmError;
 use crate::mm::{PerCPUPageMappingGuard, valid_phys_region};
 use crate::protocols::RequestParams;
+use crate::protocols::core::PVALIDATE_LOCK;
 use crate::protocols::errors::SvsmReqError;
 use crate::sev::utils::{RMPFlags, rmp_adjust};
 use crate::types::{PAGE_SIZE, PageSize};
@@ -76,6 +77,11 @@ fn adjust_guest_page(params: &RequestParams, flags: RMPFlags) -> Result<(), Svsm
     if !valid_phys_region(&region) {
         return Err(SvsmReqError::invalid_address());
     }
+
+    // Serialize against PVALIDATE and CREATE_VCPU, which change RMP state on
+    // guest pages under this lock. Without it a concurrent CREATE_VCPU on the
+    // same page could see its permissions change between its own steps.
+    let _lock = PVALIDATE_LOCK.lock_write();
 
     let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
     let vaddr = guard.virt_addr();
