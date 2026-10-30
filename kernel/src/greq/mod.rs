@@ -8,5 +8,6 @@
 
 pub mod driver;
 pub mod msg;
+pub mod pld_key;
 pub mod pld_report;
 pub mod services;

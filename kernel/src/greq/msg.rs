@@ -35,6 +35,8 @@ pub enum SnpGuestRequestAead {
 #[repr(u8)]
 pub enum SnpGuestRequestMsgType {
     Invalid = 0,
+    KeyRequest = 3,
+    KeyResponse = 4,
     ReportRequest = 5,
     ReportResponse = 6,
 }
@@ -45,6 +47,8 @@ impl TryFrom<u8> for SnpGuestRequestMsgType {
     fn try_from(v: u8) -> Result<Self, Self::Error> {
         match v {
             x if x == Self::Invalid as u8 => Ok(Self::Invalid),
+            x if x == Self::KeyRequest as u8 => Ok(Self::KeyRequest),
+            x if x == Self::KeyResponse as u8 => Ok(Self::KeyResponse),
             x if x == Self::ReportRequest as u8 => Ok(Self::ReportRequest),
             x if x == Self::ReportResponse as u8 => Ok(Self::ReportResponse),
             _ => Err(SvsmError::InvalidParameter),

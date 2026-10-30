@@ -33,6 +33,8 @@
 
 use crate::address::{Address, PhysAddr};
 use crate::error::SvsmError;
+use crate::greq::pld_key::SnpDerivedKeyRequest;
+use crate::greq::services::get_derived_key;
 use crate::mm::{PerCPUPageMappingGuard, valid_phys_region};
 use crate::protocols::RequestParams;
 use crate::protocols::core::PVALIDATE_LOCK;
@@ -40,6 +42,7 @@ use crate::protocols::errors::SvsmReqError;
 use crate::sev::utils::{RMPFlags, rmp_adjust};
 use crate::types::{PAGE_SIZE, PageSize};
 use crate::utils::MemoryRegion;
+use sha2::{Digest, Sha384};
 
 /// Drop write for the guest VMPL on one 4K page, leaving read in place.
 const SVSM_REQ_PARTTEST_REVOKE_WRITE: u32 = 0;
@@ -57,6 +60,13 @@ const SVSM_REQ_PARTTEST_NOOP: u32 = 2;
 /// to tell whether the wedged-vCPU behaviour is specific to read-only or is
 /// general to any RMP permission violation (F0X-301, experiment 2).
 const SVSM_REQ_PARTTEST_REVOKE_ALL: u32 = 3;
+/// Ask the PSP for a VMPL0 derived key and return the first 24 bytes of its
+/// SHA-384 in rcx, rdx and r8. Input: rcx = GUEST_FIELD_SELECT, rdx =
+/// ROOT_KEY_SELECT. This exists to check on silicon that the key the DICE
+/// root will use (F0X-80) is stable for one image and changes with the
+/// selected fields. The key itself is the monitor's root secret and never
+/// leaves VMPL0; only a one-way hash does, and only in parttest builds.
+const SVSM_REQ_PARTTEST_DERIVED_KEY_HASH: u32 = 4;
 
 pub const PARTTEST_PROTOCOL_VERSION_MIN: u32 = 1;
 pub const PARTTEST_PROTOCOL_VERSION_MAX: u32 = 1;
@@ -104,6 +114,29 @@ fn adjust_guest_page(params: &RequestParams, flags: RMPFlags) -> Result<(), Svsm
     })
 }
 
+fn derived_key_hash(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let root_key_select =
+        u32::try_from(params.rdx).map_err(|_| SvsmReqError::invalid_parameter())?;
+    let request = SnpDerivedKeyRequest::new(root_key_select, params.rcx, 0, 0)
+        .map_err(|_| SvsmReqError::invalid_parameter())?;
+    let key = get_derived_key(&request).map_err(|e| {
+        log::info!("parttest: MSG_KEY_REQ failed: {e:?}");
+        SvsmReqError::invalid_request()
+    })?;
+    let digest = Sha384::digest(&key[..]);
+    let word = |i: usize| {
+        u64::from_le_bytes(
+            digest[i * 8..i * 8 + 8]
+                .try_into()
+                .expect("an 8-byte slice of a 48-byte digest"),
+        )
+    };
+    params.rcx = word(0);
+    params.rdx = word(1);
+    params.r8 = word(2);
+    Ok(())
+}
+
 pub fn parttest_protocol_request(
     request: u32,
     params: &mut RequestParams,
@@ -125,6 +158,7 @@ pub fn parttest_protocol_request(
             adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::NONE)
         }
         SVSM_REQ_PARTTEST_NOOP => Ok(()),
+        SVSM_REQ_PARTTEST_DERIVED_KEY_HASH => derived_key_hash(params),
         _ => Err(SvsmReqError::unsupported_call()),
     }
 }

@@ -12,9 +12,12 @@ use crate::error::SvsmError;
 use crate::greq::{
     driver::{send_extended_guest_request, send_regular_guest_request},
     msg::SnpGuestRequestMsgType,
+    pld_key::{DERIVED_KEY_SIZE, SnpDerivedKeyRequest, SnpDerivedKeyResponse},
     pld_report::{SnpReportRequest, SnpReportResponse},
 };
 use core::mem::size_of;
+use zerocopy::IntoBytes;
+use zeroize::Zeroizing;
 
 const REPORT_REQUEST_SIZE: usize = size_of::<SnpReportRequest>();
 const REPORT_RESPONSE_SIZE: usize = size_of::<SnpReportResponse>();
@@ -104,6 +107,37 @@ pub fn get_regular_report(buffer: &mut [u8]) -> Result<usize, SvsmError> {
 ///             * `psp_rc`: PSP return code
 pub fn get_extended_report(buffer: &mut [u8], certs: &mut [u8]) -> Result<usize, SvsmError> {
     get_report(buffer, Some(certs))
+}
+
+/// Request a VMPL0 key derived by the PSP.
+///
+/// The key mixes a chip-unique root with VMPL0 and the guest fields the
+/// request selects, so it can only be reproduced by the same guest on the
+/// same chip. It is a secret: callers must not hand it to a lower VMPL.
+/// The working buffer is zeroized before returning; the returned key is
+/// zeroized when dropped.
+///
+/// # Returns
+///
+/// * Success: the 32-byte derived key
+/// * Error: [`SvsmError`], including `SnpGuestRequest(status)` if the PSP
+///   refused the request (0x16 for invalid parameters)
+pub fn get_derived_key(
+    request: &SnpDerivedKeyRequest,
+) -> Result<Zeroizing<[u8; DERIVED_KEY_SIZE]>, SvsmError> {
+    let mut buffer = Zeroizing::new([0u8; size_of::<SnpDerivedKeyResponse>()]);
+    buffer[..size_of::<SnpDerivedKeyRequest>()].copy_from_slice(request.as_bytes());
+    let response_len = send_regular_guest_request(
+        SnpGuestRequestMsgType::KeyRequest,
+        &mut buffer[..],
+        size_of::<SnpDerivedKeyRequest>(),
+    )?;
+    if response_len < size_of::<SnpDerivedKeyResponse>() {
+        return Err(SvsmError::InvalidParameter);
+    }
+    let (response, _rest) = SnpDerivedKeyResponse::ref_from_prefix(&buffer[..])
+        .map_err(|_| SvsmError::InvalidParameter)?;
+    Ok(Zeroizing::new(response.key()?))
 }
 
 #[cfg(test)]
