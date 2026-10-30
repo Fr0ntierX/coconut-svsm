@@ -74,6 +74,22 @@ const SVSM_REQ_PARTTEST_DERIVED_KEY_HASH: u32 = 4;
 /// Only public values leave VMPL0; the CDI and the alias private key do not.
 #[cfg(feature = "dice")]
 const SVSM_REQ_PARTTEST_DICE_ROOT: u32 = 5;
+/// Measure a guest memory region as a partition and return its EAT
+/// (F0X-80): the monitor token, signed by the hardware-rooted monitor alias,
+/// carrying the partition's nested token and the monitor's endorsement of the
+/// partition's measurement and alias key. With call 5's root it is a complete
+/// version 2 evidence bundle.
+///
+/// rcx is a 4K request page: nonce (32 bytes), REPORT_DATA (64), region GPA
+/// (u64), region page count (u32, at most `DICE_ATTEST_MAX_PAGES`), partition
+/// ID length (u32, at most `DICE_ATTEST_MAX_ID`), then the ID in UTF-8. rdx
+/// is a 4K output page that gets the token length (u32) followed by the token.
+#[cfg(feature = "dice")]
+const SVSM_REQ_PARTTEST_DICE_ATTEST: u32 = 6;
+#[cfg(feature = "dice")]
+const DICE_ATTEST_MAX_PAGES: usize = 256;
+#[cfg(feature = "dice")]
+const DICE_ATTEST_MAX_ID: usize = 64;
 
 #[cfg(feature = "dice")]
 fn dice_root(params: &RequestParams) -> Result<(), SvsmReqError> {
@@ -96,6 +112,61 @@ fn dice_root(params: &RequestParams) -> Result<(), SvsmReqError> {
     guard
         .guest_ptr::<AttestationReport>(ALIAS_PUBLIC_SIZE)?
         .write(report)?;
+    Ok(())
+}
+
+#[cfg(feature = "dice")]
+fn dice_attest(params: &RequestParams) -> Result<(), SvsmReqError> {
+    use crate::dice::attest_partition;
+
+    let req_pa = PhysAddr::from(params.rcx);
+    let out_pa = PhysAddr::from(params.rdx);
+    if !req_pa.is_page_aligned() || !out_pa.is_page_aligned() {
+        return Err(SvsmReqError::invalid_parameter());
+    }
+
+    let (nonce, report_data, region_pa, pages, id) = {
+        let guard = PerCPUPageMappingGuard::create_4k(req_pa)?;
+        let nonce = guard.guest_ptr::<[u8; 32]>(0)?.read()?;
+        let report_data = guard.guest_ptr::<[u8; 64]>(32)?.read()?;
+        let region_pa = guard.guest_ptr::<u64>(96)?.read()?;
+        let pages = guard.guest_ptr::<u32>(104)?.read()? as usize;
+        let id_len = guard.guest_ptr::<u32>(108)?.read()? as usize;
+        if id_len == 0 || id_len > DICE_ATTEST_MAX_ID {
+            return Err(SvsmReqError::invalid_parameter());
+        }
+        let id = guard.guest_slice::<u8>(112, id_len)?.read_to_vec()?;
+        (nonce, report_data, PhysAddr::from(region_pa), pages, id)
+    };
+    let id = core::str::from_utf8(&id).map_err(|_| SvsmReqError::invalid_parameter())?;
+    if !region_pa.is_page_aligned() || pages == 0 || pages > DICE_ATTEST_MAX_PAGES {
+        return Err(SvsmReqError::invalid_parameter());
+    }
+
+    // The partition measurement is SHA-384 over the region, page by page.
+    let mut hash = Sha384::new();
+    for i in 0..pages {
+        let pa = region_pa
+            .checked_add(i * PAGE_SIZE)
+            .ok_or_else(SvsmReqError::invalid_address)?;
+        let guard = PerCPUPageMappingGuard::create_4k(pa)?;
+        hash.update(guard.guest_slice::<u8>(0, PAGE_SIZE)?.read_to_vec()?);
+    }
+    let measurement: [u8; 48] = hash.finalize().into();
+
+    let token = attest_partition(&nonce, &report_data, id, &measurement).map_err(|e| {
+        log::info!("parttest: DICE attest failed: {e:?}");
+        SvsmReqError::invalid_request()
+    })?;
+    let len = u32::try_from(token.len()).map_err(|_| SvsmReqError::invalid_request())?;
+    if token.len() > PAGE_SIZE - 4 {
+        return Err(SvsmReqError::invalid_request());
+    }
+    let guard = PerCPUPageMappingGuard::create_4k(out_pa)?;
+    guard.guest_ptr::<u32>(0)?.write(len)?;
+    guard
+        .guest_slice::<u8>(4, token.len())?
+        .write_from_slice(&token)?;
     Ok(())
 }
 
@@ -192,6 +263,8 @@ pub fn parttest_protocol_request(
         SVSM_REQ_PARTTEST_DERIVED_KEY_HASH => derived_key_hash(params),
         #[cfg(feature = "dice")]
         SVSM_REQ_PARTTEST_DICE_ROOT => dice_root(params),
+        #[cfg(feature = "dice")]
+        SVSM_REQ_PARTTEST_DICE_ATTEST => dice_attest(params),
         _ => Err(SvsmReqError::unsupported_call()),
     }
 }

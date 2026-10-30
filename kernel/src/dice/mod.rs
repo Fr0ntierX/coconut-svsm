@@ -18,6 +18,9 @@
 
 extern crate alloc;
 
+mod cbor;
+pub mod eat;
+
 use alloc::vec::Vec;
 use core::mem::size_of;
 
@@ -35,6 +38,7 @@ use crate::greq::pld_report::{AttestationReport, SnpReportRequest, SnpReportResp
 use crate::greq::services::{get_derived_key, get_regular_report};
 
 const INFO_MONITOR_CDI: &[u8] = b"cmvm monitor cdi v1";
+const INFO_PARTITION_CDI: &[u8] = b"cmvm partition cdi v1";
 const INFO_ALIAS: &[u8] = b"cmvm alias v1";
 
 /// Domain tag hashed in front of the alias public key to form REPORT_DATA.
@@ -62,17 +66,73 @@ fn vmpl0_report(report_data: [u8; 64]) -> Result<AttestationReport, SvsmError> {
 
 /// The monitor CDI: HKDF-SHA384 over the VCEK-rooted derived key.
 fn monitor_cdi() -> Result<Zeroizing<[u8; 48]>, SvsmError> {
+    Ok(monitor_cdi_and_measurement()?.0)
+}
+
+/// The monitor CDI and the monitor's launch measurement, read from the same
+/// VMPL0 report.
+fn monitor_cdi_and_measurement() -> Result<(Zeroizing<[u8; 48]>, [u8; 48]), SvsmError> {
     // TCB_VERSION mixes in the value the request carries, so pass the TCB the
     // VCEK is derived at, read from this guest's own report. It is never above
     // the committed TCB, which the PSP requires.
-    let tcb = vmpl0_report([0u8; 64])?.reported_tcb();
+    let own = vmpl0_report([0u8; 64])?;
+    let tcb = own.reported_tcb();
     let request = SnpDerivedKeyRequest::new(ROOT_KEY_VCEK, CDI_FIELDS, 0, tcb)?;
     let key = get_derived_key(&request)?;
     let mut cdi = Zeroizing::new([0u8; 48]);
     Hkdf::<Sha384>::new(None, &key[..])
         .expand(INFO_MONITOR_CDI, &mut cdi[..])
         .map_err(|_| SvsmError::InvalidParameter)?;
+    Ok((cdi, *own.measurement()))
+}
+
+/// A partition's CDI: HKDF-SHA384 with the monitor CDI as input keying
+/// material and the partition measurement as salt, as `cmvm-dice` derives it.
+fn partition_cdi(monitor: &[u8; 48], measurement: &[u8]) -> Result<Zeroizing<[u8; 48]>, SvsmError> {
+    let mut cdi = Zeroizing::new([0u8; 48]);
+    Hkdf::<Sha384>::new(Some(measurement), monitor)
+        .expand(INFO_PARTITION_CDI, &mut cdi[..])
+        .map_err(|_| SvsmError::InvalidParameter)?;
     Ok(cdi)
+}
+
+fn sec1(key: &SigningKey) -> Result<[u8; ALIAS_PUBLIC_SIZE], SvsmError> {
+    key.verifying_key()
+        .to_sec1_point(false)
+        .as_bytes()
+        .try_into()
+        .map_err(|_| SvsmError::InvalidFormat)
+}
+
+/// Measure, derive and sign for one partition: the monitor token, carrying the
+/// partition's nested token and the monitor's endorsement of its measurement
+/// and alias key. With [`root_endorsement`] it is a complete version 2
+/// evidence bundle.
+///
+/// Prototype limit: the nested token is signed here, in VMPL0, with the alias
+/// key derived for `partition_measurement`. In the eventual design the
+/// partition holds its own key and signs it; where it does depends on how
+/// partitions run (F0X-76).
+pub fn attest_partition(
+    nonce: &[u8],
+    report_data: &[u8],
+    partition_id: &str,
+    partition_measurement: &[u8; 48],
+) -> Result<Vec<u8>, SvsmError> {
+    let (cdi, monitor_measurement) = monitor_cdi_and_measurement()?;
+    let monitor_alias = alias_key(&cdi)?;
+    let partition = partition_cdi(&cdi, partition_measurement)?;
+    let partition_alias = alias_key(&partition)?;
+    let nested = eat::nested_token(&partition_alias, nonce, partition_measurement, report_data);
+    Ok(eat::monitor_token(
+        &monitor_alias,
+        nonce,
+        &monitor_measurement,
+        partition_id,
+        partition_measurement,
+        &sec1(&partition_alias)?,
+        &nested,
+    ))
 }
 
 /// The alias key for a CDI. Re-draws with a counter in the negligible case the
@@ -107,12 +167,7 @@ pub fn alias_report_data(alias_public: &[u8]) -> [u8; 64] {
 /// checks the report against the VCEK chain.
 pub fn root_endorsement() -> Result<([u8; ALIAS_PUBLIC_SIZE], AttestationReport), SvsmError> {
     let cdi = monitor_cdi()?;
-    let alias = alias_key(&cdi)?;
-    let point = alias.verifying_key().to_sec1_point(false);
-    let public: [u8; ALIAS_PUBLIC_SIZE] = point
-        .as_bytes()
-        .try_into()
-        .map_err(|_| SvsmError::InvalidFormat)?;
+    let public = sec1(&alias_key(&cdi)?)?;
     let report = vmpl0_report(alias_report_data(&public))?;
     Ok((public, report))
 }
