@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ALIAS_PUBLIC_SIZE","CDI_FIELDS","INFO_ALIAS","INFO_MONITOR_CDI","INFO_PARTITION_CDI","REPORT_DATA_TAG","REPORT_SIZE"],"fn":["alias_key","alias_report_data","attest_partition","monitor_cdi","monitor_cdi_and_measurement","partition_cdi","root_endorsement","sec1","vmpl0_report"],"mod":["cbor","eat"]};
