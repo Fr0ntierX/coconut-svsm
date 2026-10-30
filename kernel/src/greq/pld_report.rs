@@ -194,6 +194,14 @@ pub struct AttestationReport {
     _empty: (),
 }
 
+impl AttestationReport {
+    /// REPORTED_TCB: the TCB version the VCEK that signed this report is
+    /// derived at.
+    pub fn reported_tcb(&self) -> u64 {
+        self.reported_tcb.raw
+    }
+}
+
 const _: () = assert!(
     offset_of!(SnpReportRequest, user_data) == 0x0
         && offset_of!(SnpReportRequest, vmpl) == 0x40

@@ -32,6 +32,8 @@ pub mod console;
 pub mod cpu;
 pub mod crypto;
 pub mod debug;
+#[cfg(feature = "dice")]
+pub mod dice;
 pub mod error;
 pub mod fs;
 pub mod greq;

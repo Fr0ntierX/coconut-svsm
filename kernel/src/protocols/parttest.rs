@@ -67,6 +67,37 @@ const SVSM_REQ_PARTTEST_REVOKE_ALL: u32 = 3;
 /// selected fields. The key itself is the monitor's root secret and never
 /// leaves VMPL0; only a one-way hash does, and only in parttest builds.
 const SVSM_REQ_PARTTEST_DERIVED_KEY_HASH: u32 = 4;
+/// Write the monitor's hardware root endorsement (F0X-80) to the 4K guest
+/// page at rcx: the alias public key (97-byte SEC1 point) followed by the
+/// VMPL0 attestation report that binds it in REPORT_DATA. A verifier checks
+/// the report against the VCEK chain and recomputes REPORT_DATA from the key.
+/// Only public values leave VMPL0; the CDI and the alias private key do not.
+#[cfg(feature = "dice")]
+const SVSM_REQ_PARTTEST_DICE_ROOT: u32 = 5;
+
+#[cfg(feature = "dice")]
+fn dice_root(params: &RequestParams) -> Result<(), SvsmReqError> {
+    use crate::dice::{ALIAS_PUBLIC_SIZE, root_endorsement};
+    use crate::greq::pld_report::AttestationReport;
+
+    let paddr = PhysAddr::from(params.rcx);
+    if !paddr.is_page_aligned() {
+        return Err(SvsmReqError::invalid_parameter());
+    }
+    let (public, report) = root_endorsement().map_err(|e| {
+        log::info!("parttest: DICE root endorsement failed: {e:?}");
+        SvsmReqError::invalid_request()
+    })?;
+    // guest_ptr checks the region is guest memory before anything is written.
+    let guard = PerCPUPageMappingGuard::create_4k(paddr)?;
+    guard
+        .guest_ptr::<[u8; ALIAS_PUBLIC_SIZE]>(0)?
+        .write(public)?;
+    guard
+        .guest_ptr::<AttestationReport>(ALIAS_PUBLIC_SIZE)?
+        .write(report)?;
+    Ok(())
+}
 
 pub const PARTTEST_PROTOCOL_VERSION_MIN: u32 = 1;
 pub const PARTTEST_PROTOCOL_VERSION_MAX: u32 = 1;
@@ -159,6 +190,8 @@ pub fn parttest_protocol_request(
         }
         SVSM_REQ_PARTTEST_NOOP => Ok(()),
         SVSM_REQ_PARTTEST_DERIVED_KEY_HASH => derived_key_hash(params),
+        #[cfg(feature = "dice")]
+        SVSM_REQ_PARTTEST_DICE_ROOT => dice_root(params),
         _ => Err(SvsmReqError::unsupported_call()),
     }
 }
