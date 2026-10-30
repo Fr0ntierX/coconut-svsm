@@ -200,6 +200,11 @@ impl AttestationReport {
     pub fn reported_tcb(&self) -> u64 {
         self.reported_tcb.raw
     }
+
+    /// MEASUREMENT: the launch digest of this guest.
+    pub fn measurement(&self) -> &[u8; 48] {
+        &self.measurement
+    }
 }
 
 const _: () = assert!(
