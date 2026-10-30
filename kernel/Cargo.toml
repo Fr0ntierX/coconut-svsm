@@ -53,10 +53,14 @@ cocoon-tpm-utils-common = { workspace = true }
 concat-kdf = { workspace = true, optional = true }
 gdbstub = { workspace = true, optional = true }
 gdbstub_arch = { workspace = true, optional = true }
+hkdf = { workspace = true, optional = true }
 igvm_defs = { workspace = true, features = ["unstable"] }
 intrusive-collections.workspace = true
 kbs-types = { workspace = true, optional = true, features = ["alloc"] }
 log = { workspace = true, features = ["max_level_info", "release_max_level_info"] }
+# Not the workspace entry: that one has default features (std) on, and a
+# member cannot turn them off.
+p384 = { version = "0.14.0", optional = true, default-features = false, features = ["ecdsa"] }
 packit.workspace = true
 libtcgtpm = { workspace = true, optional = true }
 rustc-demangle = { workspace = true }
@@ -103,6 +107,9 @@ vtpm = ["dep:libtcgtpm"]
 # lets the guest ask for write to be revoked on its own page, which is a test
 # surface, not a product one. Never enable in a shipping build.
 parttest = []
+# DICE layer 0 for the CMVM monitor (F0X-80): the monitor CDI from the SNP
+# derived key and its P-384 alias key, bound into a VMPL0 report.
+dice = ["dep:hkdf", "dep:p384"]
 nosmep = []
 nosmap = []
 verus_all = [
