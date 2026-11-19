@@ -14,6 +14,7 @@ pub mod parttest;
 pub mod uefivars;
 #[cfg(feature = "vtpm")]
 pub mod vtpm;
+pub mod watchdog;
 
 use cpuarch::vmsa::VMSA;
 

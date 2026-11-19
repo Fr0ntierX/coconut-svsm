@@ -105,7 +105,7 @@ fn check_vmsa(new: &VMSA, sev_features: u64, svme_mask: u64) -> bool {
 }
 
 /// per-cpu request mapping area size (1GB)
-fn core_create_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
+pub(crate) fn core_create_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
     let paddr = PhysAddr::from(params.rcx);
     let pcaa = PhysAddr::from(params.rdx);
     let apic_id: u32 = (params.r8 & 0xffff_ffff) as u32;
@@ -239,6 +239,10 @@ pub(crate) struct RetireOptions {
     /// next VMRUN. That trades the whole VM for the guarantee, which is what
     /// a watchdog wants when the host misbehaves.
     pub force: bool,
+    /// Log one info line per retire. Each line goes out over the serial
+    /// console and costs about 2.8 ms on the lab part, so a caller retiring
+    /// several vCPUs in a row turns it off and logs after the last one.
+    pub log: bool,
 }
 
 impl Default for RetireOptions {
@@ -246,6 +250,7 @@ impl Default for RetireOptions {
         Self {
             inuse_deadline: RETIRE_DEFAULT_INUSE_DEADLINE,
             force: false,
+            log: true,
         }
     }
 }
@@ -309,7 +314,7 @@ pub(crate) enum RetireError {
 
 /// The index of the first page in `pages` that is not a 4K guest page, or
 /// that is a registered VMSA or calling area.
-fn first_invalid_page(pages: &[PhysAddr]) -> Option<usize> {
+pub(crate) fn first_invalid_page(pages: &[PhysAddr]) -> Option<usize> {
     pages.iter().position(|pa| {
         let region = MemoryRegion::checked_new(*pa, PAGE_SIZE);
         !(pa.is_page_aligned()
@@ -373,13 +378,8 @@ unsafe fn revoke_guest_page_status(vaddr: VirtAddr) -> Result<(), u64> {
 /// [`RetireError::PageRevoke`].
 ///
 /// The stats come back with the error too, filled in as far as the call got.
-#[cfg_attr(
-    not(feature = "parttest"),
-    expect(
-        dead_code,
-        reason = "parttest is the only caller until the CMVM monitor lands"
-    )
-)]
+/// The watchdog (`protocols::watchdog`) calls it when a watched vCPU misses
+/// its deadline.
 pub(crate) fn retire_guest_vcpu(
     vmsa_pa: PhysAddr,
     pages: &[PhysAddr],
@@ -529,26 +529,48 @@ fn retire_guest_vcpu_inner(
     // Make the new permissions visible everywhere.
     flush_tlb_global_sync();
 
+    if opts.log {
+        log_retire(
+            vmsa_pa,
+            cpu_index,
+            apic_id,
+            pages.len(),
+            stats,
+            rdtsc() - t_start,
+        );
+    }
+
+    if let Some(e) = page_err {
+        return Err(e);
+    }
+    release
+}
+
+/// The audit line for one retire. `to_flush` is entry to the final TLB
+/// flush, without the log line itself.
+fn log_retire(
+    vmsa_pa: PhysAddr,
+    cpu_index: usize,
+    apic_id: u32,
+    npages: usize,
+    stats: &RetireStats,
+    to_flush: u64,
+) {
     log::info!(
         "retire: VMSA {vmsa_pa:#x} cpu {cpu_index} apic {apic_id} retired: ap_destroy {} lock {} vmsa {} to-flush {} ticks, inuse {}, pages {}/{}{}",
         stats.ap_destroy_ticks,
         stats.lock_ticks,
         stats.vmsa_ticks,
-        rdtsc() - t_start,
+        to_flush,
         stats.inuse_retries,
         stats.pages_revoked,
-        pages.len(),
+        npages,
         if stats.ap_destroy_refused {
             ", AP_DESTROY refused"
         } else {
             ""
         }
     );
-
-    if let Some(e) = page_err {
-        return Err(e);
-    }
-    release
 }
 
 fn core_deposit_mem(_params: &RequestParams) -> Result<(), SvsmReqError> {

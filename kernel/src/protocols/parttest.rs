@@ -34,15 +34,22 @@
 extern crate alloc;
 
 use crate::address::{Address, PhysAddr};
+use crate::cpu::msr::rdtsc;
 use crate::error::SvsmError;
 use crate::greq::pld_key::SnpDerivedKeyRequest;
 use crate::greq::services::get_derived_key;
 use crate::mm::{PerCPUPageMappingGuard, valid_phys_region};
 use crate::protocols::RequestParams;
 use crate::protocols::core::{
-    PVALIDATE_LOCK, RETIRE_DEFAULT_INUSE_DEADLINE, RetireError, RetireOptions, retire_guest_vcpu,
+    PVALIDATE_LOCK, RETIRE_DEFAULT_INUSE_DEADLINE, RetireError, RetireOptions, core_create_vcpu,
+    retire_guest_vcpu,
 };
 use crate::protocols::errors::SvsmReqError;
+use crate::protocols::watchdog::{
+    SlotState, WATCHDOG_MAX_PAGES, WatchdogError, watchdog_arm, watchdog_disarm, watchdog_status,
+    watchdog_tick,
+};
+use crate::sev::ghcb::with_current_ghcb;
 use crate::sev::utils::{RMPFlags, rmp_adjust};
 use crate::types::{PAGE_SIZE, PageSize};
 use crate::utils::MemoryRegion;
@@ -122,6 +129,37 @@ const RETIRE_ERR_PAGE_REVOKE: u64 = 0x102;
 const RETIRE_ERR_VMSA_RELEASE: u64 = 0x103;
 /// The VMSA page could not be mapped. The host was already asked to halt it.
 const RETIRE_ERR_NO_MAPPING: u64 = 0x104;
+/// Start a guest-built VMSA on another vCPU (F0X-75 watchdog tests). In: rcx
+/// = VMSA GPA, rdx = calling area GPA, r8 = APIC ID, as CREATE_VCPU. Runs
+/// CREATE_VCPU's checks and registration, then sends GHCB AP_CREATE at the
+/// guest VMPL from VMPL0, so the guest kernel needs no GHCB access of its own
+/// to hand a vCPU it took offline to a partition payload. If AP_CREATE fails
+/// the VMSA stays registered but never ran, and call 7 retires it.
+const SVSM_REQ_PARTTEST_START_VCPU: u32 = 8;
+/// Arm a watchdog slot (`watchdog::watchdog_arm`). rcx = 4K request page:
+/// VMSA GPA, heartbeat GPA (8-byte aligned), deadline in TSC ticks, page
+/// count (at most `WATCHDOG_MAX_PAGES`), then that many 4K GPAs to revoke on
+/// reclaim, all u64. Out: rcx = slot index.
+const SVSM_REQ_PARTTEST_WATCHDOG_ARM: u32 = 9;
+/// One watchdog period (`watchdog::watchdog_tick`). Only the first vCPU that
+/// ticks may tick again. Out: rcx = armed slots checked, rdx = slots retired
+/// in this tick (bitmask), r8 = VMPL0 ticks spent | slots whose retire failed
+/// (bitmask) << 32.
+const SVSM_REQ_PARTTEST_WATCHDOG_TICK: u32 = 10;
+/// Write one slot's record to a 4K guest page. In: rcx = slot, rdx = page.
+/// The record is `WATCHDOG_STATUS_WORDS` u64s, laid out in `watchdog_status`.
+const SVSM_REQ_PARTTEST_WATCHDOG_STATUS: u32 = 11;
+/// Free a slot that is armed, reclaimed or failed. In: rcx = slot.
+const SVSM_REQ_PARTTEST_WATCHDOG_DISARM: u32 = 12;
+/// AP_CREATE refused by the host. rdx = SW_EXITINFO1.
+const START_ERR_AP_CREATE: u64 = 0x110;
+/// The tick came from a vCPU other than the watchdog vCPU.
+const WATCHDOG_ERR_NOT_WATCHDOG_CPU: u64 = 0x120;
+/// No free slot.
+const WATCHDOG_ERR_FULL: u64 = 0x121;
+/// The VMSA is already watched.
+const WATCHDOG_ERR_ALREADY_WATCHED: u64 = 0x122;
+const WATCHDOG_STATUS_WORDS: usize = 22;
 #[cfg(feature = "dice")]
 const DICE_ATTEST_MAX_PAGES: usize = 256;
 #[cfg(feature = "dice")]
@@ -286,6 +324,7 @@ fn retire_vcpu(params: &mut RequestParams) -> Result<(), SvsmReqError> {
             deadline
         },
         force: params.r8 & (1u64 << 63) != 0,
+        log: true,
     };
     params.rcx = 0;
     params.rdx = 0;
@@ -349,6 +388,140 @@ fn retire_vcpu(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     })
 }
 
+fn start_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
+    let vmsa_pa = PhysAddr::from(params.rcx);
+    let apic_id = params.r8 & 0xffff_ffff;
+    core_create_vcpu(params)?;
+    with_current_ghcb(|ghcb| {
+        ghcb.ap_create(
+            vmsa_pa,
+            apic_id,
+            RMPFlags::GUEST_VMPL.bits(),
+            params.sev_features,
+        )
+    })
+    .map_err(|e| {
+        log::info!("parttest: AP_CREATE for APIC {apic_id} VMSA {vmsa_pa:#x} failed: {e:?}");
+        SvsmReqError::protocol(START_ERR_AP_CREATE)
+    })
+}
+
+fn watchdog_err(e: WatchdogError, params: &mut RequestParams) -> SvsmReqError {
+    match e {
+        WatchdogError::BadPage(i) => {
+            params.rdx = i as u64;
+            SvsmReqError::invalid_address()
+        }
+        WatchdogError::BadHeartbeat => SvsmReqError::invalid_address(),
+        WatchdogError::Read(err) => {
+            log::info!("parttest: watchdog heartbeat read failed: {err:?}");
+            SvsmReqError::invalid_address()
+        }
+        WatchdogError::BadTarget | WatchdogError::TooManyPages | WatchdogError::BadSlot => {
+            SvsmReqError::invalid_parameter()
+        }
+        WatchdogError::AlreadyWatched => SvsmReqError::protocol(WATCHDOG_ERR_ALREADY_WATCHED),
+        WatchdogError::Full => SvsmReqError::protocol(WATCHDOG_ERR_FULL),
+        WatchdogError::NotWatchdogCpu => SvsmReqError::protocol(WATCHDOG_ERR_NOT_WATCHDOG_CPU),
+    }
+}
+
+fn watchdog_arm_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let req_pa = PhysAddr::from(params.rcx);
+    if !req_pa.is_page_aligned() {
+        return Err(SvsmReqError::invalid_parameter());
+    }
+    let (vmsa_pa, hb_pa, deadline, pages) = {
+        let guard = PerCPUPageMappingGuard::create_4k(req_pa)?;
+        let head = guard.guest_slice::<u64>(0, 4)?.read_to_vec()?;
+        let count = usize::try_from(head[3]).map_err(|_| SvsmReqError::invalid_parameter())?;
+        if count > WATCHDOG_MAX_PAGES {
+            return Err(SvsmReqError::invalid_parameter());
+        }
+        let pages = guard.guest_slice::<u64>(32, count)?.read_to_vec()?;
+        (head[0], head[1], head[2], pages)
+    };
+    let pages: Vec<PhysAddr> = pages.into_iter().map(PhysAddr::from).collect();
+    params.rdx = 0;
+    let slot = watchdog_arm(
+        PhysAddr::from(vmsa_pa),
+        PhysAddr::from(hb_pa),
+        deadline,
+        pages,
+    )
+    .map_err(|e| watchdog_err(e, params))?;
+    params.rcx = slot as u64;
+    Ok(())
+}
+
+fn watchdog_tick_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let report = watchdog_tick().map_err(|e| watchdog_err(e, params))?;
+    params.rcx = u64::from(report.checked);
+    params.rdx = report.reclaimed;
+    params.r8 = (report.ticks & 0xffff_ffff) | report.failed << 32;
+    Ok(())
+}
+
+fn slot_state_code(state: SlotState) -> u64 {
+    match state {
+        SlotState::Free => 0,
+        SlotState::Armed => 1,
+        SlotState::Reclaiming => 2,
+        SlotState::Reclaimed => 3,
+        SlotState::Failed(e) => {
+            let (code, detail): (u64, u64) = match e {
+                RetireError::InvalidTarget => (1, 0),
+                RetireError::InvalidPage(i) => (2, i as u64),
+                RetireError::NoMapping => (3, 0),
+                RetireError::ApDestroy(c) => (4, c),
+                RetireError::Busy(r) => (5, r),
+                RetireError::VmsaAdjust(s) => (6, s),
+                RetireError::PageRevoke { index, status } => (7, index as u64 | status << 16),
+                RetireError::VmsaRelease(s) => (8, s),
+            };
+            4 | code << 8 | (detail & 0xffff_ffff) << 32
+        }
+    }
+}
+
+fn watchdog_status_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let index = usize::try_from(params.rcx).map_err(|_| SvsmReqError::invalid_parameter())?;
+    let out_pa = PhysAddr::from(params.rdx);
+    if !out_pa.is_page_aligned() {
+        return Err(SvsmReqError::invalid_parameter());
+    }
+    let s = watchdog_status(index).map_err(|e| watchdog_err(e, params))?;
+    let words: [u64; WATCHDOG_STATUS_WORDS] = [
+        slot_state_code(s.state),
+        u64::from(s.vmsa_pa),
+        s.cpu_index as u64,
+        s.deadline,
+        s.last_value,
+        s.last_change,
+        s.armed_at,
+        s.changes_seen,
+        s.max_gap,
+        s.read_errors,
+        s.reclaim_decided,
+        s.stale_at_reclaim,
+        s.retire.ap_destroy_ticks,
+        s.retire.lock_ticks,
+        s.retire.vmsa_ticks,
+        s.retire.total_ticks,
+        s.retire.pages_revoked as u64 | s.retire.inuse_retries << 16,
+        s.watchdog_ticks,
+        s.last_tick,
+        rdtsc(),
+        s.retire_started,
+        s.max_still,
+    ];
+    let guard = PerCPUPageMappingGuard::create_4k(out_pa)?;
+    guard
+        .guest_slice::<u64>(0, WATCHDOG_STATUS_WORDS)?
+        .write_from_slice(&words)?;
+    Ok(())
+}
+
 pub fn parttest_protocol_request(
     request: u32,
     params: &mut RequestParams,
@@ -372,6 +545,15 @@ pub fn parttest_protocol_request(
         SVSM_REQ_PARTTEST_NOOP => Ok(()),
         SVSM_REQ_PARTTEST_DERIVED_KEY_HASH => derived_key_hash(params),
         SVSM_REQ_PARTTEST_RETIRE_VCPU => retire_vcpu(params),
+        SVSM_REQ_PARTTEST_START_VCPU => start_vcpu(params),
+        SVSM_REQ_PARTTEST_WATCHDOG_ARM => watchdog_arm_call(params),
+        SVSM_REQ_PARTTEST_WATCHDOG_TICK => watchdog_tick_call(params),
+        SVSM_REQ_PARTTEST_WATCHDOG_STATUS => watchdog_status_call(params),
+        SVSM_REQ_PARTTEST_WATCHDOG_DISARM => {
+            let index =
+                usize::try_from(params.rcx).map_err(|_| SvsmReqError::invalid_parameter())?;
+            watchdog_disarm(index).map_err(|e| watchdog_err(e, params))
+        }
         #[cfg(feature = "dice")]
         SVSM_REQ_PARTTEST_DICE_ROOT => dice_root(params),
         #[cfg(feature = "dice")]
