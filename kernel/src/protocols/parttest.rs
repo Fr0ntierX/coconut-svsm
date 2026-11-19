@@ -50,7 +50,7 @@ use crate::protocols::watchdog::{
     SlotState, WATCHDOG_MAX_PAGES, WatchdogError, watchdog_arm, watchdog_disarm, watchdog_status,
     watchdog_tick,
 };
-use crate::sev::ghcb::with_current_ghcb;
+use crate::sev::ghcb::{GhcbError, with_current_ghcb};
 use crate::sev::utils::{RMPFlags, rmp_adjust};
 use crate::types::{PAGE_SIZE, PageSize};
 use crate::utils::MemoryRegion;
@@ -135,7 +135,8 @@ const RETIRE_ERR_NO_MAPPING: u64 = 0x104;
 /// CREATE_VCPU's checks and registration, then sends GHCB AP_CREATE at the
 /// guest VMPL from VMPL0, so the guest kernel needs no GHCB access of its own
 /// to hand a vCPU it took offline to a partition payload. If AP_CREATE fails
-/// the VMSA stays registered but never ran, and call 7 retires it.
+/// (`START_ERR_AP_CREATE`) the VMSA stays registered but never ran, and call
+/// 7 retires it.
 const SVSM_REQ_PARTTEST_START_VCPU: u32 = 8;
 /// Arm a watchdog slot (`watchdog::watchdog_arm`). rcx = 4K request page:
 /// VMSA GPA, heartbeat GPA (8-byte aligned), deadline in TSC ticks, page
@@ -161,7 +162,8 @@ const SVSM_REQ_PARTTEST_WATCHDOG_DISARM: u32 = 12;
 /// Out: rcx = the step of the fault this replaces (0 if none), rdx = how
 /// many times it fired, r8 = failures it had left.
 const SVSM_REQ_PARTTEST_FAULT_INJECT: u32 = 13;
-/// AP_CREATE refused by the host. rdx = SW_EXITINFO1.
+/// AP_CREATE refused by the host. rdx = SW_EXITINFO1, or u64::MAX if the GHCB
+/// answer was malformed.
 const START_ERR_AP_CREATE: u64 = 0x110;
 /// The tick came from a vCPU other than the watchdog vCPU.
 const WATCHDOG_ERR_NOT_WATCHDOG_CPU: u64 = 0x120;
@@ -398,17 +400,21 @@ fn retire_vcpu(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     })
 }
 
-fn start_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
+fn start_vcpu(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     let vmsa_pa = PhysAddr::from(params.rcx);
     let apic_id = params.r8 & 0xffff_ffff;
     core_create_vcpu(params)?;
     let vmpl = fault_inject!(ApCreate, _ => FAULT_BAD_VMPL, RMPFlags::GUEST_VMPL.bits());
-    with_current_ghcb(|ghcb| ghcb.ap_create(vmsa_pa, apic_id, vmpl, params.sev_features)).map_err(
-        |e| {
-            log::info!("parttest: AP_CREATE for APIC {apic_id} VMSA {vmsa_pa:#x} failed: {e:?}");
-            SvsmReqError::protocol(START_ERR_AP_CREATE)
-        },
-    )
+    let sev_features = params.sev_features;
+    with_current_ghcb(|ghcb| ghcb.ap_create(vmsa_pa, apic_id, vmpl, sev_features)).map_err(|e| {
+        log::info!("parttest: AP_CREATE for APIC {apic_id} VMSA {vmsa_pa:#x} failed: {e:?}");
+        // The documented detail, as call 7 reports a refused AP_DESTROY.
+        params.rdx = match e {
+            SvsmError::Ghcb(GhcbError::VmgexitError(info1, _)) => info1,
+            _ => u64::MAX,
+        };
+        SvsmReqError::protocol(START_ERR_AP_CREATE)
+    })
 }
 
 fn fault_inject_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
