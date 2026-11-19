@@ -47,8 +47,8 @@ use crate::protocols::core::{
 use crate::protocols::errors::SvsmReqError;
 use crate::protocols::faultinj::{FAULT_BAD_VMPL, Fault, FaultStep, fault_arm};
 use crate::protocols::watchdog::{
-    SlotState, WATCHDOG_MAX_PAGES, WatchdogError, watchdog_arm, watchdog_disarm, watchdog_status,
-    watchdog_tick,
+    RetryPolicy, SlotState, WATCHDOG_MAX_PAGES, WatchdogError, watchdog_arm, watchdog_disarm,
+    watchdog_status, watchdog_tick,
 };
 use crate::sev::ghcb::{GhcbError, with_current_ghcb};
 use crate::sev::utils::{RMPFlags, rmp_adjust};
@@ -141,12 +141,17 @@ const SVSM_REQ_PARTTEST_START_VCPU: u32 = 8;
 /// Arm a watchdog slot (`watchdog::watchdog_arm`). rcx = 4K request page:
 /// VMSA GPA, heartbeat GPA (8-byte aligned), deadline in TSC ticks, page
 /// count (at most `WATCHDOG_MAX_PAGES`), then that many 4K GPAs to revoke on
-/// reclaim, all u64. Out: rcx = slot index.
+/// reclaim, all u64. rdx = retry policy (`watchdog::RetryPolicy`): 0 for the
+/// default, or `ARM_POLICY_SET` with bits 0-15 = plain retries and
+/// `ARM_POLICY_NO_FORCE` to never force. r8 = with `ARM_POLICY_SET`, the
+/// retry window in TSC ticks (0 for none). Out: rcx = slot index.
 const SVSM_REQ_PARTTEST_WATCHDOG_ARM: u32 = 9;
 /// One watchdog period (`watchdog::watchdog_tick`). Only the first vCPU that
-/// ticks may tick again. Out: rcx = armed slots checked, rdx = slots retired
-/// in this tick (bitmask), r8 = VMPL0 ticks spent | slots whose retire failed
-/// (bitmask) << 32.
+/// ticks may tick again. Out: rcx = armed slots checked, rdx = slots whose
+/// vCPU was retired in this tick (bitmask), r8 = VMPL0 ticks spent (bits
+/// 0-31) | slots that finished with an error (bitmask) << 32 | slots whose
+/// retire failed and is retried next tick (bitmask) << 48. A slot retired
+/// with a clean-up error (`ReclaimedPartly`) is in both of the first two.
 const SVSM_REQ_PARTTEST_WATCHDOG_TICK: u32 = 10;
 /// Write one slot's record to a 4K guest page. In: rcx = slot, rdx = page.
 /// The record is `WATCHDOG_STATUS_WORDS` u64s, laid out in `watchdog_status`.
@@ -155,7 +160,9 @@ const SVSM_REQ_PARTTEST_WATCHDOG_STATUS: u32 = 11;
 const SVSM_REQ_PARTTEST_WATCHDOG_DISARM: u32 = 12;
 /// Arm one injected failure at a named step of the retire, START_VCPU or
 /// watchdog paths (`faultinj`), so their error paths can be driven on
-/// hardware. In: rcx = `FaultStep` code, or 0 to clear. rdx = the status the
+/// hardware. In: rcx bits 0-11 = `FaultStep` code, or 0 to clear, bits 12-63
+/// = a page-aligned VMSA GPA the fault is keyed on (0 for any target; only
+/// the retire steps name a target). rdx = the status the
 /// failing step returns, where it returns one (for FAIL_INUSE, how many fake
 /// results the retire sees, u64::MAX for all of them). r8 bits 0-31 = hits at the
 /// step to let through first, bits 32-63 = how many hits fail (0 means 1).
@@ -171,7 +178,11 @@ const WATCHDOG_ERR_NOT_WATCHDOG_CPU: u64 = 0x120;
 const WATCHDOG_ERR_FULL: u64 = 0x121;
 /// The VMSA is already watched.
 const WATCHDOG_ERR_ALREADY_WATCHED: u64 = 0x122;
-const WATCHDOG_STATUS_WORDS: usize = 22;
+const WATCHDOG_STATUS_WORDS: usize = 26;
+/// ARM rdx: a retry policy is given (otherwise the default).
+const ARM_POLICY_SET: u64 = 1 << 63;
+/// ARM rdx: never force, end `Failed` when the plain retries are used up.
+const ARM_POLICY_NO_FORCE: u64 = 1 << 62;
 #[cfg(feature = "dice")]
 const DICE_ATTEST_MAX_PAGES: usize = 256;
 #[cfg(feature = "dice")]
@@ -418,7 +429,7 @@ fn start_vcpu(params: &mut RequestParams) -> Result<(), SvsmReqError> {
 }
 
 fn fault_inject_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
-    let fault = match params.rcx {
+    let fault = match params.rcx & 0xfff {
         0 => None,
         code => {
             let step = FaultStep::from_code(code).ok_or_else(SvsmReqError::invalid_parameter)?;
@@ -428,17 +439,19 @@ fn fault_inject_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
                 value: params.rdx,
                 skip: params.r8 as u32,
                 count: count.max(1),
+                key: params.rcx & !0xfff,
             })
         }
     };
     let prev = fault_arm(fault);
     if let Some(f) = fault {
         log::info!(
-            "parttest: fault armed at {:?}, value {:#x}, skip {}, count {}",
+            "parttest: fault armed at {:?}, value {:#x}, skip {}, count {}, key {:#x}",
             f.step,
             f.value,
             f.skip,
-            f.count
+            f.count,
+            f.key
         );
     }
     params.rcx = prev.step;
@@ -483,12 +496,22 @@ fn watchdog_arm_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
         (head[0], head[1], head[2], pages)
     };
     let pages: Vec<PhysAddr> = pages.into_iter().map(PhysAddr::from).collect();
+    let policy = if params.rdx & ARM_POLICY_SET != 0 {
+        RetryPolicy {
+            retries: params.rdx as u16,
+            window: params.r8,
+            force: params.rdx & ARM_POLICY_NO_FORCE == 0,
+        }
+    } else {
+        RetryPolicy::default()
+    };
     params.rdx = 0;
     let slot = watchdog_arm(
         PhysAddr::from(vmsa_pa),
         PhysAddr::from(hb_pa),
         deadline,
         pages,
+        policy,
     )
     .map_err(|e| watchdog_err(e, params))?;
     params.rcx = slot as u64;
@@ -499,29 +522,37 @@ fn watchdog_tick_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     let report = watchdog_tick().map_err(|e| watchdog_err(e, params))?;
     params.rcx = u64::from(report.checked);
     params.rdx = report.reclaimed;
-    params.r8 = (report.ticks & 0xffff_ffff) | report.failed << 32;
+    params.r8 = (report.ticks & 0xffff_ffff) | report.failed << 32 | report.retrying << 48;
     Ok(())
 }
 
-fn slot_state_code(state: SlotState) -> u64 {
+/// A retire error as status words carry it: code << 8 | detail << 32.
+fn retire_error_code(e: RetireError) -> u64 {
+    let (code, detail): (u64, u64) = match e {
+        RetireError::InvalidTarget => (1, 0),
+        RetireError::InvalidPage(i) => (2, i as u64),
+        RetireError::NoMapping => (3, 0),
+        RetireError::ApDestroy(c) => (4, c),
+        RetireError::Busy(r) => (5, r),
+        RetireError::VmsaAdjust(s) => (6, s),
+        RetireError::PageRevoke { index, status } => (7, index as u64 | status << 16),
+        RetireError::VmsaRelease(s) => (8, s),
+    };
+    code << 8 | (detail & 0xffff_ffff) << 32
+}
+
+/// Bits 0-7 the state, and for the states that carry an error, that error as
+/// `retire_error_code` lays it out. Retrying sets bit 16 when the next
+/// attempt is forced.
+fn slot_state_code(state: SlotState, force_next: bool) -> u64 {
     match state {
         SlotState::Free => 0,
         SlotState::Armed => 1,
         SlotState::Reclaiming => 2,
         SlotState::Reclaimed => 3,
-        SlotState::Failed(e) => {
-            let (code, detail): (u64, u64) = match e {
-                RetireError::InvalidTarget => (1, 0),
-                RetireError::InvalidPage(i) => (2, i as u64),
-                RetireError::NoMapping => (3, 0),
-                RetireError::ApDestroy(c) => (4, c),
-                RetireError::Busy(r) => (5, r),
-                RetireError::VmsaAdjust(s) => (6, s),
-                RetireError::PageRevoke { index, status } => (7, index as u64 | status << 16),
-                RetireError::VmsaRelease(s) => (8, s),
-            };
-            4 | code << 8 | (detail & 0xffff_ffff) << 32
-        }
+        SlotState::Failed(e) => 4 | retire_error_code(e),
+        SlotState::Retrying(e) => 5 | retire_error_code(e) | u64::from(force_next) << 16,
+        SlotState::ReclaimedPartly(e) => 6 | retire_error_code(e),
     }
 }
 
@@ -533,7 +564,7 @@ fn watchdog_status_call(params: &mut RequestParams) -> Result<(), SvsmReqError> 
     }
     let s = watchdog_status(index).map_err(|e| watchdog_err(e, params))?;
     let words: [u64; WATCHDOG_STATUS_WORDS] = [
-        slot_state_code(s.state),
+        slot_state_code(s.state, s.force_next),
         u64::from(s.vmsa_pa),
         s.cpu_index as u64,
         s.deadline,
@@ -555,6 +586,23 @@ fn watchdog_status_call(params: &mut RequestParams) -> Result<(), SvsmReqError> 
         rdtsc(),
         s.retire_started,
         s.max_still,
+        // 22: retries | an attempt used force << 32 | the host refused
+        // AP_DESTROY on the last attempt << 33.
+        u64::from(s.retries)
+            | u64::from(s.forced) << 32
+            | u64::from(s.retire.ap_destroy_refused) << 33,
+        // 23: the policy as ARM takes it.
+        ARM_POLICY_SET
+            | u64::from(s.policy.retries)
+            | if s.policy.force {
+                0
+            } else {
+                ARM_POLICY_NO_FORCE
+            },
+        // 24: retry window, TSC ticks.
+        s.policy.window,
+        // 25: first failed attempt's error, 0 if none.
+        s.first_error.map_or(0, retire_error_code),
     ];
     let guard = PerCPUPageMappingGuard::create_4k(out_pa)?;
     guard
