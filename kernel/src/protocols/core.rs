@@ -302,7 +302,9 @@ pub(crate) enum RetireError {
     VmsaAdjust(u64),
     /// The vCPU is retired, and partition pages before `index` are revoked,
     /// but revoking page `index` returned `status`. It and later pages keep
-    /// whatever access they had.
+    /// whatever access they had. The old VMSA page is still scrubbed and
+    /// handed back. If that fails too, this error is the one reported and
+    /// the VMSA page stays revoked, as for `VmsaRelease`.
     PageRevoke { index: usize, status: u64 },
     /// The vCPU is retired and every partition page revoked, but the old
     /// VMSA page was not handed back to the guest. Carries the RMPADJUST
