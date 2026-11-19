@@ -6,6 +6,7 @@
 
 use crate::address::{Address, PhysAddr, VirtAddr};
 use crate::cpu::apic::{clear_pending_interrupts, use_apic_emulation};
+use crate::cpu::msr::rdtsc;
 use crate::cpu::percpu::{PERCPU_AREAS, PERCPU_VMSAS, this_cpu};
 use crate::cpu::{flush_tlb_global_sync, flush_tlb_global_sync_page};
 use crate::error::SvsmError;
@@ -29,9 +30,11 @@ use crate::protocols::{
     vtpm::{VTPM_PROTOCOL_VERSION_MAX, VTPM_PROTOCOL_VERSION_MIN},
 };
 use crate::requests::SvsmCaa;
+use crate::sev::ghcb::{GhcbError, with_current_ghcb};
 use crate::sev::utils::{
-    PvalidateOp, RMPFlags, SevSnpError, pvalidate, rmp_clear_guest_vmsa, rmp_grant_guest_access,
-    rmp_revoke_guest_access, rmp_set_guest_vmsa,
+    PvalidateOp, RMPADJUST_FAIL_INUSE, RMPADJUST_FAULTED, RMPFlags, SevSnpError, pvalidate,
+    rmp_adjust_status, rmp_clear_guest_vmsa, rmp_grant_guest_access, rmp_revoke_guest_access,
+    rmp_set_guest_vmsa,
 };
 use crate::sev::vmsa::VMSAControl;
 use crate::types::{PAGE_SIZE, PAGE_SIZE_2M, PageSize};
@@ -218,6 +221,334 @@ fn core_delete_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
     }
 
     res
+}
+
+/// Default bound on retrying an RMPADJUST that returns FAIL_INUSE, in TSC
+/// ticks. About 3 ms at the 3.3 GHz TSC of the lab part.
+pub(crate) const RETIRE_DEFAULT_INUSE_DEADLINE: u64 = 10_000_000;
+
+/// How [`retire_guest_vcpu`] behaves.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetireOptions {
+    /// How long to keep retrying an RMPADJUST that returns FAIL_INUSE, in
+    /// TSC ticks. This does not bound the nested page fault loop described
+    /// on [`retire_guest_vcpu`], which VMPL0 cannot interrupt.
+    pub inuse_deadline: u64,
+    /// Go on to the RMPADJUST when the host refuses AP_DESTROY. The vCPU is
+    /// still retired, but KVM was not told, so the VM stops at the target's
+    /// next VMRUN. That trades the whole VM for the guarantee, which is what
+    /// a watchdog wants when the host misbehaves.
+    pub force: bool,
+}
+
+impl Default for RetireOptions {
+    fn default() -> Self {
+        Self {
+            inuse_deadline: RETIRE_DEFAULT_INUSE_DEADLINE,
+            force: false,
+        }
+    }
+}
+
+/// What a retire cost, filled in as far as it got. All times are TSC ticks.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RetireStats {
+    /// AP_DESTROY round trip to the host.
+    pub ap_destroy_ticks: u64,
+    /// Waiting for `PVALIDATE_LOCK`.
+    pub lock_ticks: u64,
+    /// From the first RMPADJUST on the VMSA to the one that succeeded. A
+    /// target still in guest mode makes this the time until the host next
+    /// takes it out.
+    pub vmsa_ticks: u64,
+    /// Entry to return.
+    pub total_ticks: u64,
+    /// RMPADJUST calls on the VMSA that returned FAIL_INUSE.
+    pub inuse_retries: u64,
+    /// Partition pages revoked.
+    pub pages_revoked: usize,
+    /// The host refused AP_DESTROY and `force` was set.
+    pub ap_destroy_refused: bool,
+}
+
+/// Why [`retire_guest_vcpu`] stopped. Every error before `PageRevoke` leaves
+/// the RMP and the VMSA registry as they were. `NoMapping`, `Busy`,
+/// `VmsaAdjust`, and `InvalidTarget` found on the re-check under the lock
+/// come after AP_DESTROY, so the host has halted the target plane and the
+/// guest must treat that CPU as gone and retry. `PageRevoke` and
+/// `VmsaRelease` come after the vCPU is retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetireError {
+    /// Not a page-aligned, in-use, guest-created VMSA, or it is the calling
+    /// vCPU's own, or it was deleted while this call waited for the lock.
+    InvalidTarget,
+    /// The partition page at this index is not a 4K-aligned guest page, or
+    /// it is a registered VMSA or calling area.
+    InvalidPage(usize),
+    /// The VMSA page could not be mapped.
+    NoMapping,
+    /// The host refused AP_DESTROY. Carries SW_EXITINFO1, or u64::MAX if the
+    /// GHCB response was malformed. Nothing was revoked.
+    ApDestroy(u64),
+    /// RMPADJUST on the VMSA kept returning FAIL_INUSE past the deadline.
+    /// The host was already asked to destroy the plane, so a retry is safe.
+    Busy(u64),
+    /// RMPADJUST on the VMSA returned this status (or `RMPADJUST_FAULTED`).
+    VmsaAdjust(u64),
+    /// The vCPU is retired, and partition pages before `index` are revoked,
+    /// but revoking page `index` returned `status`. It and later pages keep
+    /// whatever access they had.
+    PageRevoke { index: usize, status: u64 },
+    /// The vCPU is retired and every partition page revoked, but the old
+    /// VMSA page was not handed back to the guest. Carries the RMPADJUST
+    /// status, or 0 if the host maps the page read-only so it could not be
+    /// scrubbed. The page stays revoked from the guest, which leaks it but
+    /// exposes nothing.
+    VmsaRelease(u64),
+}
+
+/// The index of the first page in `pages` that is not a 4K guest page, or
+/// that is a registered VMSA or calling area.
+fn first_invalid_page(pages: &[PhysAddr]) -> Option<usize> {
+    pages.iter().position(|pa| {
+        let region = MemoryRegion::checked_new(*pa, PAGE_SIZE);
+        !(pa.is_page_aligned()
+            && region.is_some_and(|r| valid_phys_region(&r) && !PERCPU_VMSAS.overlaps(&r)))
+    })
+}
+
+/// Revoke every guest VMPL's access to one 4K page, returning the first
+/// non-zero RMPADJUST status.
+///
+/// # Safety
+/// `vaddr` must map a guest page. Revoking guest access cannot affect SVSM
+/// memory safety, but a page another VMPL2 vCPU is using will spin that vCPU
+/// on nested page faults until access returns.
+unsafe fn revoke_guest_page_status(vaddr: VirtAddr) -> Result<(), u64> {
+    for vmpl in RMPFlags::GUEST_VMPL.bits()..=RMPFlags::VMPL3.bits() {
+        let flags = RMPFlags::from_bits_truncate(vmpl) | RMPFlags::NONE;
+        // SAFETY: the caller guarantees vaddr maps a guest page.
+        match unsafe { rmp_adjust_status(vaddr, flags, PageSize::Regular) } {
+            0 => {}
+            status => return Err(status),
+        }
+    }
+    Ok(())
+}
+
+/// Retire a guest vCPU at the guest VMPL, then revoke a partition's pages.
+///
+/// This is the reclaim step of the CMVM watchdog (uPolaris threat model
+/// section 9.3). Steps, in order:
+///
+/// 1. Check the target is a guest-created, in-use VMSA that is not the
+///    calling vCPU's, and that every page in `pages` is a 4K guest page that
+///    is not a registered VMSA or calling area.
+/// 2. GHCB AP_DESTROY for the target's APIC ID at the guest VMPL, before
+///    taking `PVALIDATE_LOCK`, so the host's kick has time to land. Without
+///    it the retire still works but KVM is not told, and the VM stops at the
+///    target's next VMRUN (measured on the lab part, 16 Nov 2026).
+/// 3. Under `PVALIDATE_LOCK`, RMPADJUST the VMSA page to no access at the
+///    guest VMPL, which clears the VMSA attribute. Success is the hardware
+///    proof that the vCPU is out of guest mode and can never re-enter. The
+///    APM allows FAIL_INUSE here, which is retried until
+///    `opts.inuse_deadline`. On the parts we have measured the hardware never
+///    returns it: while the target is in guest mode the instruction raises a
+///    nested page fault on the VMSA page, the host resumes it, and it runs
+///    again. VMPL0 never regains control during that loop, so its length is
+///    set by the host (about 7 us when the AP_DESTROY kick lands, about
+///    0.8 ms when it misses and the target waits for its next timer exit).
+///    A hostile host can stretch it, which is denial of service.
+/// 4. Unregister the VMSA, revoke every guest VMPL's access to each page in
+///    `pages`, then zero the old VMSA page and give it back to the guest VMPL
+///    as `core_delete_vcpu` does. Scrubbing anything the vCPU held is only
+///    safe after step 3, never after the AP_DESTROY return.
+///
+/// The guest kernel must have taken the target CPU offline. An NMI sent to a
+/// retired vCPU makes KVM refuse to run it and stops the VM, and the other
+/// CPUs wedge waiting on it otherwise.
+///
+/// Partition pages are revoked at 4K. A page the guest validated as part of
+/// a 2M RMP entry returns FAIL_SIZEMISMATCH and is reported as
+/// [`RetireError::PageRevoke`].
+///
+/// The stats come back with the error too, filled in as far as the call got.
+#[cfg_attr(
+    not(feature = "parttest"),
+    expect(
+        dead_code,
+        reason = "parttest is the only caller until the CMVM monitor lands"
+    )
+)]
+pub(crate) fn retire_guest_vcpu(
+    vmsa_pa: PhysAddr,
+    pages: &[PhysAddr],
+    opts: &RetireOptions,
+) -> Result<RetireStats, (RetireError, RetireStats)> {
+    let t_start = rdtsc();
+    let mut stats = RetireStats::default();
+    let res = retire_guest_vcpu_inner(vmsa_pa, pages, opts, &mut stats);
+    stats.total_ticks = rdtsc() - t_start;
+    match res {
+        Ok(()) => Ok(stats),
+        Err(e) => Err((e, stats)),
+    }
+}
+
+fn retire_guest_vcpu_inner(
+    vmsa_pa: PhysAddr,
+    pages: &[PhysAddr],
+    opts: &RetireOptions,
+    stats: &mut RetireStats,
+) -> Result<(), RetireError> {
+    let t_start = rdtsc();
+
+    if !vmsa_pa.is_page_aligned() {
+        return Err(RetireError::InvalidTarget);
+    }
+    let cpu_index = match PERCPU_VMSAS.in_use_owner(vmsa_pa) {
+        Some((index, true)) => index,
+        _ => return Err(RetireError::InvalidTarget),
+    };
+    // Destroying our own guest plane would leave this vCPU nothing to return
+    // to, and KVM would stop the VM on the way back.
+    if cpu_index == this_cpu().get_cpu_index() {
+        return Err(RetireError::InvalidTarget);
+    }
+    // Checked here so a bad list is refused before the host is told
+    // anything, and again under the lock below.
+    if let Some(i) = first_invalid_page(pages) {
+        return Err(RetireError::InvalidPage(i));
+    }
+    let apic_id = PERCPU_AREAS.get_by_cpu_index(cpu_index).apic_id();
+
+    let t_apd = rdtsc();
+    let apd =
+        with_current_ghcb(|ghcb| ghcb.ap_destroy(u64::from(apic_id), RMPFlags::GUEST_VMPL.bits()));
+    stats.ap_destroy_ticks = rdtsc() - t_apd;
+    if let Err(e) = apd {
+        let code = match e {
+            SvsmError::Ghcb(GhcbError::VmgexitError(info1, _)) => info1,
+            _ => u64::MAX,
+        };
+        if !opts.force {
+            return Err(RetireError::ApDestroy(code));
+        }
+        log::warn!("retire: host refused AP_DESTROY for APIC {apic_id} ({code:#x}), forcing");
+        stats.ap_destroy_refused = true;
+    }
+
+    let t_lock = rdtsc();
+    let lock = PVALIDATE_LOCK.lock_write();
+    stats.lock_ticks = rdtsc() - t_lock;
+
+    // Another CPU may have deleted or retired it while the lock was free, or
+    // made one of the pages a VMSA, which the revoke below would retire.
+    if PERCPU_VMSAS.in_use_owner(vmsa_pa) != Some((cpu_index, true)) {
+        return Err(RetireError::InvalidTarget);
+    }
+    if let Some(i) = first_invalid_page(pages) {
+        return Err(RetireError::InvalidPage(i));
+    }
+
+    let guard = PerCPUPageMappingGuard::create_4k(vmsa_pa).map_err(|_| RetireError::NoMapping)?;
+    let vaddr = guard.virt_addr();
+
+    let t_vmsa = rdtsc();
+    loop {
+        // SAFETY: the page is a registered guest-created VMSA. Taking the
+        // guest VMPL's access and the VMSA attribute away cannot expose SVSM
+        // memory.
+        let status = unsafe {
+            rmp_adjust_status(
+                vaddr,
+                RMPFlags::GUEST_VMPL | RMPFlags::NONE,
+                PageSize::Regular,
+            )
+        };
+        match status {
+            0 => break,
+            RMPADJUST_FAIL_INUSE => {
+                stats.inuse_retries += 1;
+                if rdtsc() - t_vmsa > opts.inuse_deadline {
+                    return Err(RetireError::Busy(stats.inuse_retries));
+                }
+                core::hint::spin_loop();
+            }
+            other => return Err(RetireError::VmsaAdjust(other)),
+        }
+    }
+    stats.vmsa_ticks = rdtsc() - t_vmsa;
+
+    // From here the vCPU is gone. Unregister before anything that can fail,
+    // because the page is no longer a VMSA whatever happens next.
+    if let Err(e) = PERCPU_VMSAS.unregister(vmsa_pa, true) {
+        log::error!("retire: VMSA {vmsa_pa:#x} retired but not unregistered: {e:?}");
+    }
+
+    let mut page_err = None;
+    for (i, pa) in pages.iter().enumerate() {
+        let res = PerCPUPageMappingGuard::create_4k(*pa)
+            .map_err(|_| RMPADJUST_FAULTED)
+            // SAFETY: the page was checked to be a guest page above.
+            .and_then(|g| unsafe { revoke_guest_page_status(g.virt_addr()) });
+        if let Err(status) = res {
+            page_err = Some(RetireError::PageRevoke { index: i, status });
+            break;
+        }
+        stats.pages_revoked += 1;
+    }
+
+    // The old VMSA holds the last register state of whatever ran there.
+    // Scrub it before the guest VMPL can read it again. A page the host maps
+    // read-only would spin the write on nested page faults, so that one is
+    // left revoked, as the PVALIDATE path does.
+    // SAFETY: the page is a guest page that is no longer a VMSA. VMPL3 never
+    // had access to a VMSA, so this only makes sure. Zeroing it is a write
+    // to a page only VMPL0 can reach, through a mapping this function owns.
+    let release = unsafe {
+        match rmp_adjust_status(vaddr, RMPFlags::VMPL3 | RMPFlags::NONE, PageSize::Regular) {
+            0 if !writable_phys_addr(vmsa_pa) => Err(RetireError::VmsaRelease(0)),
+            0 => {
+                zero_mem_region(vaddr, vaddr + PAGE_SIZE);
+                match rmp_adjust_status(
+                    vaddr,
+                    RMPFlags::GUEST_VMPL | RMPFlags::RWX,
+                    PageSize::Regular,
+                ) {
+                    0 => Ok(()),
+                    s => Err(RetireError::VmsaRelease(s)),
+                }
+            }
+            s => Err(RetireError::VmsaRelease(s)),
+        }
+    };
+
+    drop(guard);
+    drop(lock);
+    // Make the new permissions visible everywhere.
+    flush_tlb_global_sync();
+
+    log::info!(
+        "retire: VMSA {vmsa_pa:#x} cpu {cpu_index} apic {apic_id} retired: ap_destroy {} lock {} vmsa {} to-flush {} ticks, inuse {}, pages {}/{}{}",
+        stats.ap_destroy_ticks,
+        stats.lock_ticks,
+        stats.vmsa_ticks,
+        rdtsc() - t_start,
+        stats.inuse_retries,
+        stats.pages_revoked,
+        pages.len(),
+        if stats.ap_destroy_refused {
+            ", AP_DESTROY refused"
+        } else {
+            ""
+        }
+    );
+
+    if let Some(e) = page_err {
+        return Err(e);
+    }
+    release
 }
 
 fn core_deposit_mem(_params: &RequestParams) -> Result<(), SvsmReqError> {

@@ -1010,6 +1010,16 @@ impl PerCpuVmsas {
             .any(|vmsa| vmsa.paddr == paddr && vmsa.in_use)
     }
 
+    /// The CPU index and guest ownership of the in-use VMSA at `paddr`, or
+    /// None if no in-use VMSA is registered there.
+    pub fn in_use_owner(&self, paddr: PhysAddr) -> Option<(usize, bool)> {
+        self.vmsas
+            .lock_read()
+            .iter()
+            .find(|vmsa| vmsa.paddr == paddr && vmsa.in_use)
+            .map(|vmsa| (vmsa.cpu_index, vmsa.guest_owned))
+    }
+
     pub fn overlaps(&self, region: &MemoryRegion<PhysAddr>) -> bool {
         self.vmsas.lock_read().iter().any(|vmsa| {
             region.overlap(&MemoryRegion::new(vmsa.paddr, PAGE_SIZE))

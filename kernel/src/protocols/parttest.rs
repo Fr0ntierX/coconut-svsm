@@ -31,17 +31,22 @@
 // enabled in a shipping build. It is not registered in the protocol dispatch
 // unless that feature is on.
 
+extern crate alloc;
+
 use crate::address::{Address, PhysAddr};
 use crate::error::SvsmError;
 use crate::greq::pld_key::SnpDerivedKeyRequest;
 use crate::greq::services::get_derived_key;
 use crate::mm::{PerCPUPageMappingGuard, valid_phys_region};
 use crate::protocols::RequestParams;
-use crate::protocols::core::PVALIDATE_LOCK;
+use crate::protocols::core::{
+    PVALIDATE_LOCK, RETIRE_DEFAULT_INUSE_DEADLINE, RetireError, RetireOptions, retire_guest_vcpu,
+};
 use crate::protocols::errors::SvsmReqError;
 use crate::sev::utils::{RMPFlags, rmp_adjust};
 use crate::types::{PAGE_SIZE, PageSize};
 use crate::utils::MemoryRegion;
+use alloc::vec::Vec;
 use sha2::{Digest, Sha384};
 
 /// Drop write for the guest VMPL on one 4K page, leaving read in place.
@@ -86,6 +91,37 @@ const SVSM_REQ_PARTTEST_DICE_ROOT: u32 = 5;
 /// is a 4K output page that gets the token length (u32) followed by the token.
 #[cfg(feature = "dice")]
 const SVSM_REQ_PARTTEST_DICE_ATTEST: u32 = 6;
+/// Retire a guest vCPU and revoke a partition's pages (F0X-75 watchdog
+/// reclaim), through `core::retire_guest_vcpu`. The guest must take the
+/// target CPU offline first.
+///
+/// In: rcx = the target's VMSA GPA. rdx = GPA of a 4K page list, or 0 for
+/// none: a u64 count (at most `RETIRE_MAX_PAGES`) followed by that many 4K
+/// GPAs. r8 bits 0-62 = FAIL_INUSE deadline in TSC ticks (0 for the
+/// default), bit 63 = retire even if the host refuses AP_DESTROY.
+///
+/// Out, on success and on every error: rcx = AP_DESTROY ticks, rdx = ticks
+/// from the first RMPADJUST on the VMSA to success, r8 = pages revoked
+/// (bits 0-15) | FAIL_INUSE retries (16-47) | AP_DESTROY refused (63).
+///
+/// Errors: INVALID_PARAMETER (not a guest-created in-use VMSA, the caller's
+/// own vCPU, or a bad list), INVALID_ADDRESS (a list entry is not a guest
+/// page or is a VMSA or calling area, entry index in rdx), BUSY (FAIL_INUSE
+/// past the deadline), and the protocol codes below, whose detail goes in
+/// rdx. See `RetireError` for what each leaves behind.
+const SVSM_REQ_PARTTEST_RETIRE_VCPU: u32 = 7;
+const RETIRE_MAX_PAGES: usize = PAGE_SIZE / 8 - 1;
+/// Host refused AP_DESTROY, nothing revoked. rdx = SW_EXITINFO1.
+const RETIRE_ERR_AP_DESTROY: u64 = 0x100;
+/// RMPADJUST on the VMSA failed, nothing revoked. rdx = status.
+const RETIRE_ERR_VMSA_ADJUST: u64 = 0x101;
+/// Retired, but revoking a partition page failed. rdx = index | status << 32.
+const RETIRE_ERR_PAGE_REVOKE: u64 = 0x102;
+/// Retired and pages revoked, but the scrubbed VMSA page stays revoked from
+/// the guest. rdx = status.
+const RETIRE_ERR_VMSA_RELEASE: u64 = 0x103;
+/// The VMSA page could not be mapped. The host was already asked to halt it.
+const RETIRE_ERR_NO_MAPPING: u64 = 0x104;
 #[cfg(feature = "dice")]
 const DICE_ATTEST_MAX_PAGES: usize = 256;
 #[cfg(feature = "dice")]
@@ -239,6 +275,80 @@ fn derived_key_hash(params: &mut RequestParams) -> Result<(), SvsmReqError> {
     Ok(())
 }
 
+fn retire_vcpu(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let vmsa_pa = PhysAddr::from(params.rcx);
+    let list_pa = PhysAddr::from(params.rdx);
+    let deadline = params.r8 & !(1u64 << 63);
+    let opts = RetireOptions {
+        inuse_deadline: if deadline == 0 {
+            RETIRE_DEFAULT_INUSE_DEADLINE
+        } else {
+            deadline
+        },
+        force: params.r8 & (1u64 << 63) != 0,
+    };
+    params.rcx = 0;
+    params.rdx = 0;
+    params.r8 = 0;
+
+    let mut pages: Vec<PhysAddr> = Vec::new();
+    if !list_pa.is_null() {
+        if !list_pa.is_page_aligned() {
+            return Err(SvsmReqError::invalid_parameter());
+        }
+        let guard = PerCPUPageMappingGuard::create_4k(list_pa)?;
+        let count = guard.guest_ptr::<u64>(0)?.read()?;
+        let count = usize::try_from(count).map_err(|_| SvsmReqError::invalid_parameter())?;
+        if count > RETIRE_MAX_PAGES {
+            return Err(SvsmReqError::invalid_parameter());
+        }
+        let entries = guard.guest_slice::<u64>(8, count)?.read_to_vec()?;
+        pages
+            .try_reserve_exact(count)
+            .map_err(|_| SvsmReqError::invalid_request())?;
+        pages.extend(entries.into_iter().map(PhysAddr::from));
+    }
+
+    let (res, stats) = match retire_guest_vcpu(vmsa_pa, &pages, &opts) {
+        Ok(stats) => (Ok(()), stats),
+        Err((e, stats)) => (Err(e), stats),
+    };
+    params.rcx = stats.ap_destroy_ticks;
+    params.rdx = stats.vmsa_ticks;
+    params.r8 = (stats.pages_revoked as u64 & 0xffff)
+        | (stats.inuse_retries & 0xffff_ffff) << 16
+        | u64::from(stats.ap_destroy_refused) << 63;
+
+    res.map_err(|e| {
+        log::info!("parttest: retire of VMSA {vmsa_pa:#x} failed: {e:?}");
+        match e {
+            RetireError::InvalidTarget => SvsmReqError::invalid_parameter(),
+            RetireError::InvalidPage(i) => {
+                params.rdx = i as u64;
+                SvsmReqError::invalid_address()
+            }
+            RetireError::NoMapping => SvsmReqError::protocol(RETIRE_ERR_NO_MAPPING),
+            RetireError::ApDestroy(code) => {
+                params.rdx = code;
+                SvsmReqError::protocol(RETIRE_ERR_AP_DESTROY)
+            }
+            RetireError::Busy(_) => SvsmReqError::busy(),
+            RetireError::VmsaAdjust(status) => {
+                params.rdx = status;
+                SvsmReqError::protocol(RETIRE_ERR_VMSA_ADJUST)
+            }
+            RetireError::PageRevoke { index, status } => {
+                params.rdx = index as u64 | status << 32;
+                SvsmReqError::protocol(RETIRE_ERR_PAGE_REVOKE)
+            }
+            RetireError::VmsaRelease(status) => {
+                params.rdx = status;
+                SvsmReqError::protocol(RETIRE_ERR_VMSA_RELEASE)
+            }
+        }
+    })
+}
+
 pub fn parttest_protocol_request(
     request: u32,
     params: &mut RequestParams,
@@ -261,6 +371,7 @@ pub fn parttest_protocol_request(
         }
         SVSM_REQ_PARTTEST_NOOP => Ok(()),
         SVSM_REQ_PARTTEST_DERIVED_KEY_HASH => derived_key_hash(params),
+        SVSM_REQ_PARTTEST_RETIRE_VCPU => retire_vcpu(params),
         #[cfg(feature = "dice")]
         SVSM_REQ_PARTTEST_DICE_ROOT => dice_root(params),
         #[cfg(feature = "dice")]
