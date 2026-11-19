@@ -422,9 +422,13 @@ fn retire_guest_vcpu_inner(
     }
     let apic_id = PERCPU_AREAS.get_by_cpu_index(cpu_index).apic_id();
 
+    let destroy_vmpl = fault_inject!(
+        ApDestroy,
+        _ => crate::protocols::faultinj::FAULT_BAD_VMPL,
+        RMPFlags::GUEST_VMPL.bits()
+    );
     let t_apd = rdtsc();
-    let apd =
-        with_current_ghcb(|ghcb| ghcb.ap_destroy(u64::from(apic_id), RMPFlags::GUEST_VMPL.bits()));
+    let apd = with_current_ghcb(|ghcb| ghcb.ap_destroy(u64::from(apic_id), destroy_vmpl));
     stats.ap_destroy_ticks = rdtsc() - t_apd;
     if let Err(e) = apd {
         let code = match e {
@@ -451,21 +455,38 @@ fn retire_guest_vcpu_inner(
         return Err(RetireError::InvalidPage(i));
     }
 
-    let guard = PerCPUPageMappingGuard::create_4k(vmsa_pa).map_err(|_| RetireError::NoMapping)?;
+    let guard = fault_inject!(
+        VmsaMap,
+        _ => Err(RetireError::NoMapping),
+        PerCPUPageMappingGuard::create_4k(vmsa_pa).map_err(|_| RetireError::NoMapping)
+    )?;
     let vaddr = guard.virt_addr();
 
+    // Fault injection: FAIL_INUSE results to fake before the real RMPADJUST.
+    #[cfg(feature = "parttest")]
+    let mut fake_inuse: u64 = fault_inject!(VmsaInuse, n => n, 0);
     let t_vmsa = rdtsc();
     loop {
-        // SAFETY: the page is a registered guest-created VMSA. Taking the
-        // guest VMPL's access and the VMSA attribute away cannot expose SVSM
-        // memory.
-        let status = unsafe {
-            rmp_adjust_status(
-                vaddr,
-                RMPFlags::GUEST_VMPL | RMPFlags::NONE,
-                PageSize::Regular,
+        let status = fault_inject!(
+            if fake_inuse > 0 => {
+                fake_inuse -= 1;
+                RMPADJUST_FAIL_INUSE
+            },
+            fault_inject!(
+                VmsaAdjust,
+                s => s,
+                // SAFETY: the page is a registered guest-created VMSA. Taking
+                // the guest VMPL's access and the VMSA attribute away cannot
+                // expose SVSM memory.
+                unsafe {
+                    rmp_adjust_status(
+                        vaddr,
+                        RMPFlags::GUEST_VMPL | RMPFlags::NONE,
+                        PageSize::Regular,
+                    )
+                }
             )
-        };
+        );
         match status {
             0 => break,
             RMPADJUST_FAIL_INUSE => {
@@ -490,8 +511,14 @@ fn retire_guest_vcpu_inner(
     for (i, pa) in pages.iter().enumerate() {
         let res = PerCPUPageMappingGuard::create_4k(*pa)
             .map_err(|_| RMPADJUST_FAULTED)
-            // SAFETY: the page was checked to be a guest page above.
-            .and_then(|g| unsafe { revoke_guest_page_status(g.virt_addr()) });
+            .and_then(|g| {
+                fault_inject!(
+                    PageRevoke,
+                    s => Err(s),
+                    // SAFETY: the page was checked to be a guest page above.
+                    unsafe { revoke_guest_page_status(g.virt_addr()) }
+                )
+            });
         if let Err(status) = res {
             page_err = Some(RetireError::PageRevoke { index: i, status });
             break;
@@ -503,25 +530,34 @@ fn retire_guest_vcpu_inner(
     // Scrub it before the guest VMPL can read it again. A page the host maps
     // read-only would spin the write on nested page faults, so that one is
     // left revoked, as the PVALIDATE path does.
-    // SAFETY: the page is a guest page that is no longer a VMSA. VMPL3 never
-    // had access to a VMSA, so this only makes sure. Zeroing it is a write
-    // to a page only VMPL0 can reach, through a mapping this function owns.
-    let release = unsafe {
-        match rmp_adjust_status(vaddr, RMPFlags::VMPL3 | RMPFlags::NONE, PageSize::Regular) {
-            0 if !writable_phys_addr(vmsa_pa) => Err(RetireError::VmsaRelease(0)),
-            0 => {
-                zero_mem_region(vaddr, vaddr + PAGE_SIZE);
-                match rmp_adjust_status(
-                    vaddr,
-                    RMPFlags::GUEST_VMPL | RMPFlags::RWX,
-                    PageSize::Regular,
-                ) {
-                    0 => Ok(()),
-                    s => Err(RetireError::VmsaRelease(s)),
-                }
-            }
-            s => Err(RetireError::VmsaRelease(s)),
+    let vmpl3_none = fault_inject!(
+        ReleaseVmpl3,
+        s => s,
+        // SAFETY: the page is a guest page that is no longer a VMSA. VMPL3
+        // never had access to a VMSA, so this only makes sure.
+        unsafe { rmp_adjust_status(vaddr, RMPFlags::VMPL3 | RMPFlags::NONE, PageSize::Regular) }
+    );
+    let release = match vmpl3_none {
+        0 if fault_inject!(ReleaseReadOnly, _ => true, !writable_phys_addr(vmsa_pa)) => {
+            Err(RetireError::VmsaRelease(0))
         }
+        0 => {
+            // SAFETY: a write to a page only VMPL0 can reach, through a
+            // mapping this function owns.
+            unsafe { zero_mem_region(vaddr, vaddr + PAGE_SIZE) };
+            match fault_inject!(
+                ReleaseGrant,
+                s => s,
+                // SAFETY: as above, the page is a scrubbed guest page.
+                unsafe {
+                    rmp_adjust_status(vaddr, RMPFlags::GUEST_VMPL | RMPFlags::RWX, PageSize::Regular)
+                }
+            ) {
+                0 => Ok(()),
+                s => Err(RetireError::VmsaRelease(s)),
+            }
+        }
+        s => Err(RetireError::VmsaRelease(s)),
     };
 
     drop(guard);
