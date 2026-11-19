@@ -260,38 +260,12 @@ bitflags::bitflags! {
 /// does not violate memory safety.  Memory safety could be affected if the
 /// page is exposed to a lower VMPL or becomes a VMSA.
 pub unsafe fn rmp_adjust(addr: VirtAddr, flags: RMPFlags, size: PageSize) -> Result<(), SvsmError> {
-    let rcx: u64 = match size {
-        PageSize::Regular => 0,
-        PageSize::Huge => 1,
-    };
-    let rax: u64 = addr.bits() as u64;
-    let rdx: u64 = flags.bits();
-    let mut ret: u64;
-    let mut ex: u64;
-
-    // SAFETY: the caller promises that the adjust operation is safe.
-    unsafe {
-        asm!("1: rmpadjust
-                 xorq %rcx, %rcx
-              2:
-              .pushsection \"__exception_table\",\"a\"
-              .balign 16
-              .quad (1b)
-              .quad (2b)
-              .popsection",
-                inout("rax") rax => ret,
-                inout("rcx") rcx => ex,
-                in("rdx") rdx,
-                options(att_syntax));
-    }
-
-    if ex != 0 {
-        // Report exceptions just as FAIL_INPUT
-        return Err(SevSnpError::FAIL_INPUT(1).into());
-    }
+    // SAFETY: the caller upholds the same contract.
+    let ret = unsafe { rmp_adjust_status(addr, flags, size) };
 
     match ret {
         0 => Ok(()),
+        RMPADJUST_FAULTED => Err(SevSnpError::FAIL_INPUT(1).into()),
         1 => Err(SevSnpError::FAIL_INPUT(ret).into()),
         2 => Err(SevSnpError::FAIL_PERMISSION(ret).into()),
         6 => Err(SevSnpError::FAIL_SIZEMISMATCH(ret).into()),
@@ -300,6 +274,54 @@ pub unsafe fn rmp_adjust(addr: VirtAddr, flags: RMPFlags, size: PageSize) -> Res
             unreachable!();
         }
     }
+}
+
+/// RMPADJUST status: the target page is a VMSA that is in use. On the parts
+/// we have measured the hardware never returns this for a running VMSA (it
+/// raises a nested page fault that the host resumes instead), but the APM
+/// defines it, so callers that can meet a live VMSA must handle it.
+pub const RMPADJUST_FAIL_INUSE: u64 = 3;
+/// Not an RMPADJUST status: the instruction raised an exception.
+pub const RMPADJUST_FAULTED: u64 = u64::MAX;
+
+/// RMPADJUST that hands back the raw status instead of mapping it, and never
+/// panics. `RMPADJUST_FAULTED` means the instruction raised an exception.
+///
+/// # Safety
+/// Same contract as [`rmp_adjust`].
+pub unsafe fn rmp_adjust_status(addr: VirtAddr, flags: RMPFlags, size: PageSize) -> u64 {
+    let rcx: u64 = match size {
+        PageSize::Regular => 0,
+        PageSize::Huge => 1,
+    };
+    let rax: u64 = addr.bits() as u64;
+    let rdx: u64 = flags.bits();
+    let ret: u64;
+    let ex: u64;
+
+    // The exception flag lives in its own register, set before the
+    // instruction and cleared after it. The fixup lands on 2: and skips the
+    // clear. Reusing rcx for the flag, as this code once did, misses an
+    // exception on a 4K request, because rcx is 0 for those going in.
+    // SAFETY: the caller promises that the adjust operation is safe.
+    unsafe {
+        asm!("movq $1, {ex}
+              1: rmpadjust
+                 xorq {ex}, {ex}
+              2:
+              .pushsection \"__exception_table\",\"a\"
+              .balign 16
+              .quad (1b)
+              .quad (2b)
+              .popsection",
+                ex = out(reg) ex,
+                inout("rax") rax => ret,
+                in("rcx") rcx,
+                in("rdx") rdx,
+                options(att_syntax));
+    }
+
+    if ex != 0 { RMPADJUST_FAULTED } else { ret }
 }
 
 pub fn rmp_revoke_guest_access(vaddr: VirtAddr, size: PageSize) -> Result<(), SvsmError> {
