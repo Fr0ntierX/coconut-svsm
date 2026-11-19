@@ -734,6 +734,18 @@ impl GHCB {
         Ok(())
     }
 
+    /// GHCB AP Creation with request 2 (AP_DESTROY): ask the host to stop
+    /// running `apic_id` at `vmpl`. KVM marks that plane's VMSA invalid, halts
+    /// it and kicks it out of guest mode. The host is untrusted, so success
+    /// here proves nothing about the vCPU. Only a later RMPADJUST that clears
+    /// the VMSA attribute does.
+    pub fn ap_destroy(&self, apic_id: u64, vmpl: u64) -> Result<(), SvsmError> {
+        self.clear();
+        let exit_info_1: u64 = 2 | (vmpl & 0xf) << 16 | apic_id << 32;
+        self.vmgexit(GHCBExitCode::AP_CREATE, exit_info_1, 0)?;
+        Ok(())
+    }
+
     pub fn register_hv_doorbell(&self, paddr: PhysAddr) -> Result<(), SvsmError> {
         self.clear();
         self.vmgexit(GHCBExitCode::HV_DOORBELL, 1, u64::from(paddr))?;
