@@ -4,10 +4,43 @@
 //
 // Author: Dov Murik <dovmurik@linux.ibm.com>
 
+/// Fault injection point for the parttest error-path tests (F0X-75).
+///
+/// `fault_inject!(Step, v => injected, normal)` evaluates `injected` (with
+/// the armed value bound to `v`) when a fault armed at `FaultStep::Step`
+/// fires, and `normal` otherwise. Without the `parttest` feature it expands
+/// to `normal` alone, so neither the fault state nor the injected branch
+/// exists in the build. `fault_inject!(if cond => injected, normal)` is the
+/// same switch on a condition over parttest-only state.
+#[cfg(feature = "parttest")]
+macro_rules! fault_inject {
+    (if $cond:expr => $injected:expr, $normal:expr) => {
+        if $cond { $injected } else { $normal }
+    };
+    ($step:ident, $v:pat => $injected:expr, $normal:expr) => {
+        match crate::protocols::faultinj::fault_hit(crate::protocols::faultinj::FaultStep::$step) {
+            Some($v) => $injected,
+            None => $normal,
+        }
+    };
+}
+
+#[cfg(not(feature = "parttest"))]
+macro_rules! fault_inject {
+    (if $cond:expr => $injected:expr, $normal:expr) => {
+        $normal
+    };
+    ($step:ident, $v:pat => $injected:expr, $normal:expr) => {
+        $normal
+    };
+}
+
 pub mod apic;
 pub mod attest;
 pub mod core;
 pub mod errors;
+#[cfg(feature = "parttest")]
+pub mod faultinj;
 #[cfg(feature = "parttest")]
 pub mod parttest;
 #[cfg(feature = "uefivars")]
