@@ -45,6 +45,7 @@ use crate::protocols::core::{
     retire_guest_vcpu,
 };
 use crate::protocols::errors::SvsmReqError;
+use crate::protocols::faultinj::{FAULT_BAD_VMPL, Fault, FaultStep, fault_arm};
 use crate::protocols::watchdog::{
     SlotState, WATCHDOG_MAX_PAGES, WatchdogError, watchdog_arm, watchdog_disarm, watchdog_status,
     watchdog_tick,
@@ -151,6 +152,15 @@ const SVSM_REQ_PARTTEST_WATCHDOG_TICK: u32 = 10;
 const SVSM_REQ_PARTTEST_WATCHDOG_STATUS: u32 = 11;
 /// Free a slot that is armed, reclaimed or failed. In: rcx = slot.
 const SVSM_REQ_PARTTEST_WATCHDOG_DISARM: u32 = 12;
+/// Arm one injected failure at a named step of the retire, START_VCPU or
+/// watchdog paths (`faultinj`), so their error paths can be driven on
+/// hardware. In: rcx = `FaultStep` code, or 0 to clear. rdx = the status the
+/// failing step returns, where it returns one (for FAIL_INUSE, how many fake
+/// results the retire sees, u64::MAX for all of them). r8 bits 0-31 = hits at the
+/// step to let through first, bits 32-63 = how many hits fail (0 means 1).
+/// Out: rcx = the step of the fault this replaces (0 if none), rdx = how
+/// many times it fired, r8 = failures it had left.
+const SVSM_REQ_PARTTEST_FAULT_INJECT: u32 = 13;
 /// AP_CREATE refused by the host. rdx = SW_EXITINFO1.
 const START_ERR_AP_CREATE: u64 = 0x110;
 /// The tick came from a vCPU other than the watchdog vCPU.
@@ -392,18 +402,43 @@ fn start_vcpu(params: &RequestParams) -> Result<(), SvsmReqError> {
     let vmsa_pa = PhysAddr::from(params.rcx);
     let apic_id = params.r8 & 0xffff_ffff;
     core_create_vcpu(params)?;
-    with_current_ghcb(|ghcb| {
-        ghcb.ap_create(
-            vmsa_pa,
-            apic_id,
-            RMPFlags::GUEST_VMPL.bits(),
-            params.sev_features,
-        )
-    })
-    .map_err(|e| {
-        log::info!("parttest: AP_CREATE for APIC {apic_id} VMSA {vmsa_pa:#x} failed: {e:?}");
-        SvsmReqError::protocol(START_ERR_AP_CREATE)
-    })
+    let vmpl = fault_inject!(ApCreate, _ => FAULT_BAD_VMPL, RMPFlags::GUEST_VMPL.bits());
+    with_current_ghcb(|ghcb| ghcb.ap_create(vmsa_pa, apic_id, vmpl, params.sev_features)).map_err(
+        |e| {
+            log::info!("parttest: AP_CREATE for APIC {apic_id} VMSA {vmsa_pa:#x} failed: {e:?}");
+            SvsmReqError::protocol(START_ERR_AP_CREATE)
+        },
+    )
+}
+
+fn fault_inject_call(params: &mut RequestParams) -> Result<(), SvsmReqError> {
+    let fault = match params.rcx {
+        0 => None,
+        code => {
+            let step = FaultStep::from_code(code).ok_or_else(SvsmReqError::invalid_parameter)?;
+            let count = (params.r8 >> 32) as u32;
+            Some(Fault {
+                step,
+                value: params.rdx,
+                skip: params.r8 as u32,
+                count: count.max(1),
+            })
+        }
+    };
+    let prev = fault_arm(fault);
+    if let Some(f) = fault {
+        log::info!(
+            "parttest: fault armed at {:?}, value {:#x}, skip {}, count {}",
+            f.step,
+            f.value,
+            f.skip,
+            f.count
+        );
+    }
+    params.rcx = prev.step;
+    params.rdx = prev.fired;
+    params.r8 = u64::from(prev.remaining);
+    Ok(())
 }
 
 fn watchdog_err(e: WatchdogError, params: &mut RequestParams) -> SvsmReqError {
@@ -554,6 +589,7 @@ pub fn parttest_protocol_request(
                 usize::try_from(params.rcx).map_err(|_| SvsmReqError::invalid_parameter())?;
             watchdog_disarm(index).map_err(|e| watchdog_err(e, params))
         }
+        SVSM_REQ_PARTTEST_FAULT_INJECT => fault_inject_call(params),
         #[cfg(feature = "dice")]
         SVSM_REQ_PARTTEST_DICE_ROOT => dice_root(params),
         #[cfg(feature = "dice")]

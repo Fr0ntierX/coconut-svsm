@@ -217,7 +217,11 @@ pub(crate) struct TickReport {
 }
 
 fn read_heartbeat(pa: PhysAddr) -> Result<u64, SvsmError> {
-    let guard = PerCPUPageMappingGuard::create_4k(pa.page_align())?;
+    let guard = fault_inject!(
+        HeartbeatRead,
+        _ => Err(SvsmError::Fault),
+        PerCPUPageMappingGuard::create_4k(pa.page_align())
+    )?;
     guard.guest_ptr::<u64>(pa.page_offset())?.read()
 }
 
@@ -267,11 +271,12 @@ pub(crate) fn watchdog_arm(
     {
         return Err(WatchdogError::AlreadyWatched);
     }
-    let index = wd
-        .slots
-        .iter()
-        .position(|s| s.state == SlotState::Free)
-        .ok_or(WatchdogError::Full)?;
+    let free = fault_inject!(
+        WatchdogFull,
+        _ => None,
+        wd.slots.iter().position(|s| s.state == SlotState::Free)
+    );
+    let index = free.ok_or(WatchdogError::Full)?;
     let now = rdtsc();
     wd.slots[index] = Slot {
         state: SlotState::Armed,
