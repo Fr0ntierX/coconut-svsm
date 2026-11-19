@@ -15,6 +15,10 @@
 // * RMPADJUST failures and mapping failures replace the operation, so the RMP
 //   is left exactly as a real failure would leave it.
 //
+// A fault can be keyed on one target (the VMSA GPA for the retire steps). It
+// then fires only at call sites that name that target, so a test can fail one
+// slot's retires while the watchdog reclaims another slot in the same tick.
+//
 // The whole module, and every call site through `fault_inject!`, exists only
 // with the `parttest` feature. A build without it has no fault state and no
 // injected branches.
@@ -89,6 +93,10 @@ pub(crate) struct Fault {
     pub skip: u32,
     /// Failures left. The fault disarms itself at zero.
     pub count: u32,
+    /// Fire only at call sites keyed on this value (a page-aligned VMSA GPA
+    /// for the retire steps). 0 fires at every call site of the step, keyed
+    /// or not. Skips count matching hits only.
+    pub key: u64,
 }
 
 /// What `fault_arm` replaced, for the guest to confirm a fault fired.
@@ -130,8 +138,17 @@ pub(crate) fn fault_arm(fault: Option<Fault>) -> FaultReport {
 
 /// Called at `step`. Returns the armed value when this hit should fail.
 pub(crate) fn fault_hit(step: FaultStep) -> Option<u64> {
+    fault_hit_at(step, 0)
+}
+
+/// Called at `step` working on `key`. A fault keyed on another value lets
+/// the hit through without counting it.
+pub(crate) fn fault_hit_at(step: FaultStep, key: u64) -> Option<u64> {
     let mut st = FAULT.lock();
-    let f = st.armed.as_mut().filter(|f| f.step == step)?;
+    let f = st
+        .armed
+        .as_mut()
+        .filter(|f| f.step == step && (f.key == 0 || f.key == key))?;
     if f.skip > 0 {
         f.skip -= 1;
         return None;
@@ -160,6 +177,7 @@ mod tests {
             value: 6,
             skip: 2,
             count: 2,
+            key: 0,
         }));
         assert_eq!(prev.step, 0);
         assert_eq!(fault_hit(FaultStep::VmsaAdjust), None);
@@ -174,6 +192,7 @@ mod tests {
             value: 0,
             skip: 0,
             count: 5,
+            key: 0,
         }));
         assert_eq!(prev.step, FaultStep::PageRevoke as u64);
         assert_eq!(prev.fired, 2);
@@ -185,6 +204,21 @@ mod tests {
         assert_eq!(prev.remaining, 4);
         assert_eq!(fault_hit(FaultStep::VmsaInuse), None);
         assert_eq!(FaultStep::from_code(12), None);
+
+        // Keyed: other keys and unkeyed sites pass and do not use the skip.
+        fault_arm(Some(Fault {
+            step: FaultStep::ApDestroy,
+            value: 0,
+            skip: 1,
+            count: 1,
+            key: 0x5000,
+        }));
+        assert_eq!(fault_hit_at(FaultStep::ApDestroy, 0x6000), None);
+        assert_eq!(fault_hit(FaultStep::ApDestroy), None);
+        assert_eq!(fault_hit_at(FaultStep::ApDestroy, 0x5000), None);
+        assert_eq!(fault_hit_at(FaultStep::ApDestroy, 0x6000), None);
+        assert_eq!(fault_hit_at(FaultStep::ApDestroy, 0x5000), Some(0));
+        assert_eq!(fault_arm(None).fired, 1);
         assert_eq!(FaultStep::from_code(5), Some(FaultStep::PageRevoke));
     }
 }
