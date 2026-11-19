@@ -236,8 +236,9 @@ pub(crate) struct RetireOptions {
     pub inuse_deadline: u64,
     /// Go on to the RMPADJUST when the host refuses AP_DESTROY. The vCPU is
     /// still retired, but KVM was not told, so the VM stops at the target's
-    /// next VMRUN. That trades the whole VM for the guarantee, which is what
-    /// a watchdog wants when the host misbehaves.
+    /// next VMRUN. That trades the whole VM for the guarantee. The watchdog
+    /// uses it only as the last attempt on a slot whose plain retries the
+    /// host kept refusing (`watchdog::RetryPolicy`).
     pub force: bool,
     /// Log one info line per retire. Each line goes out over the serial
     /// console and costs about 2.8 ms on the lab part, so a caller retiring
@@ -423,9 +424,12 @@ fn retire_guest_vcpu_inner(
         return Err(RetireError::InvalidPage(i));
     }
     let apic_id = PERCPU_AREAS.get_by_cpu_index(cpu_index).apic_id();
+    // What a fault injected for this target is keyed on (parttest only).
+    #[cfg(feature = "parttest")]
+    let key = u64::from(vmsa_pa);
 
     let destroy_vmpl = fault_inject!(
-        ApDestroy,
+        ApDestroy @ key,
         _ => crate::protocols::faultinj::FAULT_BAD_VMPL,
         RMPFlags::GUEST_VMPL.bits()
     );
@@ -440,7 +444,12 @@ fn retire_guest_vcpu_inner(
         if !opts.force {
             return Err(RetireError::ApDestroy(code));
         }
-        log::warn!("retire: host refused AP_DESTROY for APIC {apic_id} ({code:#x}), forcing");
+        // Behind `log` like the audit line, so a watchdog forcing several
+        // retires in one tick is not held up by the serial console. The
+        // refusal is in the stats either way.
+        if opts.log {
+            log::warn!("retire: host refused AP_DESTROY for APIC {apic_id} ({code:#x}), forcing");
+        }
         stats.ap_destroy_refused = true;
     }
 
@@ -458,7 +467,7 @@ fn retire_guest_vcpu_inner(
     }
 
     let guard = fault_inject!(
-        VmsaMap,
+        VmsaMap @ key,
         _ => Err(RetireError::NoMapping),
         PerCPUPageMappingGuard::create_4k(vmsa_pa).map_err(|_| RetireError::NoMapping)
     )?;
@@ -466,7 +475,7 @@ fn retire_guest_vcpu_inner(
 
     // Fault injection: FAIL_INUSE results to fake before the real RMPADJUST.
     #[cfg(feature = "parttest")]
-    let mut fake_inuse: u64 = fault_inject!(VmsaInuse, n => n, 0);
+    let mut fake_inuse: u64 = fault_inject!(VmsaInuse @ key, n => n, 0);
     let t_vmsa = rdtsc();
     loop {
         let status = fault_inject!(
@@ -475,7 +484,7 @@ fn retire_guest_vcpu_inner(
                 RMPADJUST_FAIL_INUSE
             },
             fault_inject!(
-                VmsaAdjust,
+                VmsaAdjust @ key,
                 s => s,
                 // SAFETY: the page is a registered guest-created VMSA. Taking
                 // the guest VMPL's access and the VMSA attribute away cannot
@@ -515,7 +524,7 @@ fn retire_guest_vcpu_inner(
             .map_err(|_| RMPADJUST_FAULTED)
             .and_then(|g| {
                 fault_inject!(
-                    PageRevoke,
+                    PageRevoke @ key,
                     s => Err(s),
                     // SAFETY: the page was checked to be a guest page above.
                     unsafe { revoke_guest_page_status(g.virt_addr()) }
@@ -533,14 +542,14 @@ fn retire_guest_vcpu_inner(
     // read-only would spin the write on nested page faults, so that one is
     // left revoked, as the PVALIDATE path does.
     let vmpl3_none = fault_inject!(
-        ReleaseVmpl3,
+        ReleaseVmpl3 @ key,
         s => s,
         // SAFETY: the page is a guest page that is no longer a VMSA. VMPL3
         // never had access to a VMSA, so this only makes sure.
         unsafe { rmp_adjust_status(vaddr, RMPFlags::VMPL3 | RMPFlags::NONE, PageSize::Regular) }
     );
     let release = match vmpl3_none {
-        0 if fault_inject!(ReleaseReadOnly, _ => true, !writable_phys_addr(vmsa_pa)) => {
+        0 if fault_inject!(ReleaseReadOnly @ key, _ => true, !writable_phys_addr(vmsa_pa)) => {
             Err(RetireError::VmsaRelease(0))
         }
         0 => {
@@ -548,7 +557,7 @@ fn retire_guest_vcpu_inner(
             // mapping this function owns.
             unsafe { zero_mem_region(vaddr, vaddr + PAGE_SIZE) };
             match fault_inject!(
-                ReleaseGrant,
+                ReleaseGrant @ key,
                 s => s,
                 // SAFETY: as above, the page is a scrubbed guest page.
                 unsafe {

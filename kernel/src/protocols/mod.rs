@@ -10,12 +10,24 @@
 /// the armed value bound to `v`) when a fault armed at `FaultStep::Step`
 /// fires, and `normal` otherwise. Without the `parttest` feature it expands
 /// to `normal` alone, so neither the fault state nor the injected branch
-/// exists in the build. `fault_inject!(if cond => injected, normal)` is the
-/// same switch on a condition over parttest-only state.
+/// exists in the build. `fault_inject!(Step @ key, v => injected, normal)`
+/// does the same at a step that names what it works on (the target VMSA's
+/// GPA for the retire steps), so a fault armed for one target leaves the
+/// others alone. `fault_inject!(if cond => injected, normal)` is the same
+/// switch on a condition over parttest-only state.
 #[cfg(feature = "parttest")]
 macro_rules! fault_inject {
     (if $cond:expr => $injected:expr, $normal:expr) => {
         if $cond { $injected } else { $normal }
+    };
+    ($step:ident @ $key:expr, $v:pat => $injected:expr, $normal:expr) => {
+        match crate::protocols::faultinj::fault_hit_at(
+            crate::protocols::faultinj::FaultStep::$step,
+            $key,
+        ) {
+            Some($v) => $injected,
+            None => $normal,
+        }
     };
     ($step:ident, $v:pat => $injected:expr, $normal:expr) => {
         match crate::protocols::faultinj::fault_hit(crate::protocols::faultinj::FaultStep::$step) {
@@ -28,6 +40,9 @@ macro_rules! fault_inject {
 #[cfg(not(feature = "parttest"))]
 macro_rules! fault_inject {
     (if $cond:expr => $injected:expr, $normal:expr) => {
+        $normal
+    };
+    ($step:ident @ $key:expr, $v:pat => $injected:expr, $normal:expr) => {
         $normal
     };
     ($step:ident, $v:pat => $injected:expr, $normal:expr) => {
