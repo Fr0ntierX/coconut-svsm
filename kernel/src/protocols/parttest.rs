@@ -97,6 +97,12 @@ const SVSM_REQ_PARTTEST_DICE_ROOT: u32 = 5;
 /// (u64), region page count (u32, at most `DICE_ATTEST_MAX_PAGES`), partition
 /// ID length (u32, at most `DICE_ATTEST_MAX_ID`), then the ID in UTF-8. rdx
 /// is a 4K output page that gets the token length (u32) followed by the token.
+///
+/// r8 = flags, 0 for none. With `DICE_ATTEST_WRAP_KEY` the request page also
+/// holds the partition's wrap public key (F0X-898), a 97-byte uncompressed
+/// SEC1 P-384 point at `DICE_ATTEST_WRAP_OFFSET`, and the nested token carries
+/// it as a COSE_Key in its `cnf` claim. The point must be on the curve. A
+/// verifier also requires REPORT_DATA to be SHA-512(nonce || that COSE_Key).
 #[cfg(feature = "dice")]
 const SVSM_REQ_PARTTEST_DICE_ATTEST: u32 = 6;
 /// Retire a guest vCPU and revoke a partition's pages (F0X-75 watchdog
@@ -187,6 +193,12 @@ const ARM_POLICY_NO_FORCE: u64 = 1 << 62;
 const DICE_ATTEST_MAX_PAGES: usize = 256;
 #[cfg(feature = "dice")]
 const DICE_ATTEST_MAX_ID: usize = 64;
+/// Call 6 r8 flag: the request carries a wrap key for `cnf`.
+#[cfg(feature = "dice")]
+const DICE_ATTEST_WRAP_KEY: u64 = 1;
+/// Where the wrap key sits in the call 6 request page, after the longest ID.
+#[cfg(feature = "dice")]
+const DICE_ATTEST_WRAP_OFFSET: usize = 112 + DICE_ATTEST_MAX_ID;
 
 #[cfg(feature = "dice")]
 fn dice_root(params: &RequestParams) -> Result<(), SvsmReqError> {
@@ -214,15 +226,19 @@ fn dice_root(params: &RequestParams) -> Result<(), SvsmReqError> {
 
 #[cfg(feature = "dice")]
 fn dice_attest(params: &RequestParams) -> Result<(), SvsmReqError> {
-    use crate::dice::attest_partition;
+    use crate::dice::{WRAP_PUBLIC_SIZE, attest_partition, check_wrap_key};
 
     let req_pa = PhysAddr::from(params.rcx);
     let out_pa = PhysAddr::from(params.rdx);
     if !req_pa.is_page_aligned() || !out_pa.is_page_aligned() {
         return Err(SvsmReqError::invalid_parameter());
     }
+    if params.r8 & !DICE_ATTEST_WRAP_KEY != 0 {
+        return Err(SvsmReqError::invalid_parameter());
+    }
+    let with_wrap_key = params.r8 & DICE_ATTEST_WRAP_KEY != 0;
 
-    let (nonce, report_data, region_pa, pages, id) = {
+    let (nonce, report_data, region_pa, pages, id, wrap_key) = {
         let guard = PerCPUPageMappingGuard::create_4k(req_pa)?;
         let nonce = guard.guest_ptr::<[u8; 32]>(0)?.read()?;
         let report_data = guard.guest_ptr::<[u8; 64]>(32)?.read()?;
@@ -233,9 +249,29 @@ fn dice_attest(params: &RequestParams) -> Result<(), SvsmReqError> {
             return Err(SvsmReqError::invalid_parameter());
         }
         let id = guard.guest_slice::<u8>(112, id_len)?.read_to_vec()?;
-        (nonce, report_data, PhysAddr::from(region_pa), pages, id)
+        let wrap_key = if with_wrap_key {
+            Some(
+                guard
+                    .guest_ptr::<[u8; WRAP_PUBLIC_SIZE]>(DICE_ATTEST_WRAP_OFFSET)?
+                    .read()?,
+            )
+        } else {
+            None
+        };
+        (
+            nonce,
+            report_data,
+            PhysAddr::from(region_pa),
+            pages,
+            id,
+            wrap_key,
+        )
     };
     let id = core::str::from_utf8(&id).map_err(|_| SvsmReqError::invalid_parameter())?;
+    // A wrap key that is not a P-384 point is the caller's mistake.
+    if let Some(w) = &wrap_key {
+        check_wrap_key(w).map_err(|_| SvsmReqError::invalid_parameter())?;
+    }
     if !region_pa.is_page_aligned() || pages == 0 || pages > DICE_ATTEST_MAX_PAGES {
         return Err(SvsmReqError::invalid_parameter());
     }
@@ -251,10 +287,11 @@ fn dice_attest(params: &RequestParams) -> Result<(), SvsmReqError> {
     }
     let measurement: [u8; 48] = hash.finalize().into();
 
-    let token = attest_partition(&nonce, &report_data, id, &measurement).map_err(|e| {
-        log::info!("parttest: DICE attest failed: {e:?}");
-        SvsmReqError::invalid_request()
-    })?;
+    let token = attest_partition(&nonce, &report_data, id, &measurement, wrap_key.as_ref())
+        .map_err(|e| {
+            log::info!("parttest: DICE attest failed: {e:?}");
+            SvsmReqError::invalid_request()
+        })?;
     let len = u32::try_from(token.len()).map_err(|_| SvsmReqError::invalid_request())?;
     if token.len() > PAGE_SIZE - 4 {
         return Err(SvsmReqError::invalid_request());

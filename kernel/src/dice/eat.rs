@@ -10,6 +10,11 @@
 //! keys are the RFC 9711 registrations plus the profile's private keys.
 //!
 //! Signatures are COSE_Sign1 (RFC 9052) with ES384, untagged.
+//!
+//! A nested token can also carry the partition's wrap key (F0X-898) in a CWT
+//! confirmation claim (RFC 8747), `8: {1: COSE_Key}`, byte for byte as
+//! `cmvm-dice`'s `nested_token_with_wrap_key` writes it. The wrap key is the
+//! HPKE key a KMS seals a released key to.
 
 extern crate alloc;
 
@@ -29,6 +34,9 @@ const CLAIM_MEASUREMENTS: i64 = 273;
 const CLAIM_PARTITION_ENDORSEMENTS: i64 = -70001;
 const CLAIM_REPORT_DATA: i64 = -70002;
 const CLAIM_ALIAS_KEY: i64 = -70003;
+/// RFC 8747 confirmation claim, and its COSE_Key member.
+const CLAIM_CNF: i64 = 8;
+const CNF_COSE_KEY: i64 = 1;
 
 /// Measurement content type from the CoAP experimental range, for a CBOR
 /// `[alg, digest]` record. `ALG_SHA384` is the profile's tag for SHA-384.
@@ -58,21 +66,39 @@ fn measurements(out: &mut Vec<u8>, digest: &[u8]) {
     cbor::bytes(out, &record);
 }
 
-/// The COSE_Key for a P-384 public key given as an uncompressed SEC1 point.
+/// The COSE_Key for a P-384 signing (alias) public key given as an
+/// uncompressed SEC1 point. Labeled ES384.
 pub fn cose_key(sec1: &[u8; 97]) -> Vec<u8> {
     let mut out = Vec::new();
-    cbor::map(&mut out, 5);
-    cbor::int(&mut out, COSE_KEY_KTY);
-    cbor::int(&mut out, COSE_KTY_EC2);
-    cbor::int(&mut out, COSE_KEY_ALG);
-    cbor::int(&mut out, COSE_ALG_ES384);
-    cbor::int(&mut out, COSE_EC2_CRV);
-    cbor::int(&mut out, COSE_CRV_P384);
-    cbor::int(&mut out, COSE_EC2_X);
-    cbor::bytes(&mut out, &sec1[1..49]);
-    cbor::int(&mut out, COSE_EC2_Y);
-    cbor::bytes(&mut out, &sec1[49..97]);
+    ec2_p384_key(&mut out, sec1, Some(COSE_ALG_ES384));
     out
+}
+
+/// The COSE_Key for a P-384 wrap (HPKE) public key: no `alg`, as `cmvm-dice`
+/// `WrapPublicKey::to_cose` encodes it. Its bytes are the `wrap_pubkey` that
+/// `report_data` hashes. `cmvm-dice` refuses an ES384-labeled key as a wrap
+/// key, so an alias key can't be passed off as one.
+pub fn wrap_cose_key(sec1: &[u8; 97]) -> Vec<u8> {
+    let mut out = Vec::new();
+    ec2_p384_key(&mut out, sec1, None);
+    out
+}
+
+/// An EC2 P-384 COSE_Key in the order coset writes it: kty, alg, crv, x, y.
+fn ec2_p384_key(out: &mut Vec<u8>, sec1: &[u8; 97], alg: Option<i64>) {
+    cbor::map(out, if alg.is_some() { 5 } else { 4 });
+    cbor::int(out, COSE_KEY_KTY);
+    cbor::int(out, COSE_KTY_EC2);
+    if let Some(alg) = alg {
+        cbor::int(out, COSE_KEY_ALG);
+        cbor::int(out, alg);
+    }
+    cbor::int(out, COSE_EC2_CRV);
+    cbor::int(out, COSE_CRV_P384);
+    cbor::int(out, COSE_EC2_X);
+    cbor::bytes(out, &sec1[1..49]);
+    cbor::int(out, COSE_EC2_Y);
+    cbor::bytes(out, &sec1[49..97]);
 }
 
 /// An untagged COSE_Sign1 over `payload` with ES384.
@@ -100,23 +126,47 @@ pub fn sign1(key: &SigningKey, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The partition's nested token: nonce, its measurement and `report_data`,
-/// signed by the partition alias key.
-pub fn nested_token(
-    partition_alias: &SigningKey,
+/// The partition's nested token claims: nonce, its measurement,
+/// `report_data` and, if given, the wrap key in `cnf`. The order is the one
+/// `cmvm-dice` writes, so the same inputs give the same bytes.
+fn nested_claims(
     nonce: &[u8],
     partition_measurement: &[u8],
     report_data: &[u8],
+    wrap_key: Option<&[u8; 97]>,
 ) -> Vec<u8> {
     let mut claims = Vec::new();
-    cbor::map(&mut claims, 3);
+    cbor::map(&mut claims, if wrap_key.is_some() { 4 } else { 3 });
     cbor::int(&mut claims, CLAIM_NONCE);
     cbor::bytes(&mut claims, nonce);
     cbor::int(&mut claims, CLAIM_MEASUREMENTS);
     measurements(&mut claims, partition_measurement);
     cbor::int(&mut claims, CLAIM_REPORT_DATA);
     cbor::bytes(&mut claims, report_data);
-    sign1(partition_alias, &claims)
+    if let Some(wrap) = wrap_key {
+        // The COSE_Key goes in as a CBOR map, not a byte string.
+        cbor::int(&mut claims, CLAIM_CNF);
+        cbor::map(&mut claims, 1);
+        cbor::int(&mut claims, CNF_COSE_KEY);
+        claims.extend_from_slice(&wrap_cose_key(wrap));
+    }
+    claims
+}
+
+/// The partition's nested token, signed by the partition alias key. With
+/// `wrap_key` (an uncompressed SEC1 P-384 point) it carries that key in
+/// `cnf`. The caller checks the point is on the curve.
+pub fn nested_token(
+    partition_alias: &SigningKey,
+    nonce: &[u8],
+    partition_measurement: &[u8],
+    report_data: &[u8],
+    wrap_key: Option<&[u8; 97]>,
+) -> Vec<u8> {
+    sign1(
+        partition_alias,
+        &nested_claims(nonce, partition_measurement, report_data, wrap_key),
+    )
 }
 
 /// The monitor token for one partition, signed by the monitor alias key.
@@ -175,5 +225,89 @@ mod tests {
         cbor::bytes(&mut tbs, &[]);
         cbor::bytes(&mut tbs, b"payload");
         assert!(key.verifying_key().verify(&tbs, &sig).is_ok());
+    }
+
+    // Known vectors from uPolaris cmvm-dice (main 2e70873), printed by a test
+    // that builds them with `WrapKey::from_scalar_bytes`,
+    // `Monitor::new(Cdi::from_bytes([7; 48]), stub_measure(b"monitor"))`,
+    // `partition(stub_measure(b"image"))`, `nested_token_with_wrap_key` and
+    // `token`. Nonce is 32 bytes of 9, partition ID "p0". ECDSA here and there
+    // is RFC 6979 deterministic, so the signed tokens match byte for byte.
+
+    /// SEC1 point of the wrap key with scalar 0x0102..30, the one cmvm-dice's
+    /// HPKE interop test uses.
+    const WRAP_SEC1: &str = "04c76f2283dda95cd49b0ed9e733d2904474e37216f124e13d2c9ab4cf01021c49ad9cabb3d0b97499aef2f0ab313fa02826bc1f83451b5c8962a75caff73588d4400a6296436154fb343c393e91048a6c7bcbadc83cd8a5f26feae883156f92a1";
+    /// `WrapPublicKey::to_cose()` for that key.
+    const WRAP_COSE: &str = "a401022002215830c76f2283dda95cd49b0ed9e733d2904474e37216f124e13d2c9ab4cf01021c49ad9cabb3d0b97499aef2f0ab313fa02822583026bc1f83451b5c8962a75caff73588d4400a6296436154fb343c393e91048a6c7bcbadc83cd8a5f26feae883156f92a1";
+    /// `compute_report_data(nonce, WRAP_COSE)`: SHA-512(nonce || COSE_Key).
+    const REPORT_DATA: &str = "09eef9ccd06b511205d08969d2eac1305f635ea4dc417a06531a120c68a1e1559a9739daa91438517cd054889e31d95877c8b81ae3391d0382569edbffc0b11b";
+    const MONITOR_MEASUREMENT: &str = "9d0514b37dee26bb60aee45ba5a54174520be70b772d1b46a4f87cdfec073ced5312dd6085c3f346ee8109f2872ea427";
+    const PARTITION_MEASUREMENT: &str = "7158862be7ff7d2ae0a585b872f415cf09b7fe8c6ce170ef944061e7788d73c1f5835652d8afe9939b01905d5aa7c48c";
+    /// `nested_token_with_wrap_key`.
+    const NESTED: &str = "8444a1013822a0590117a40a58200909090909090909090909090909090909090909090909090909090909090909190111818219fde85834820158307158862be7ff7d2ae0a585b872f415cf09b7fe8c6ce170ef944061e7788d73c1f5835652d8afe9939b01905d5aa7c48c3a00011171584009eef9ccd06b511205d08969d2eac1305f635ea4dc417a06531a120c68a1e1559a9739daa91438517cd054889e31d95877c8b81ae3391d0382569edbffc0b11b08a101a401022002215830c76f2283dda95cd49b0ed9e733d2904474e37216f124e13d2c9ab4cf01021c49ad9cabb3d0b97499aef2f0ab313fa02822583026bc1f83451b5c8962a75caff73588d4400a6296436154fb343c393e91048a6c7bcbadc83cd8a5f26feae883156f92a15860e3534eb9de1a029648c154a410b94ebd3147e2bda70e94a43b9af7e7373bbe04612f415503e96c9cc0308d2a1ab9a013586f74ce6dae98556d9d314c68f39daeef030a41d03e49b2903f64f12dbd56ba90963fe464e98510c45b194f245bbf2a";
+    /// `Monitor::token` carrying that nested token.
+    const MONITOR_TOKEN: &str = "8444a1013822a05902d3a519010978227461673a6672306e74696572782e636f6d2c323032363a636d766d2d6561742d76310a58200909090909090909090909090909090909090909090909090909090909090909190111818219fde85834820158309d0514b37dee26bb60aee45ba5a54174520be70b772d1b46a4f87cdfec073ced5312dd6085c3f346ee8109f2872ea42719010aa16270305901838444a1013822a0590117a40a58200909090909090909090909090909090909090909090909090909090909090909190111818219fde85834820158307158862be7ff7d2ae0a585b872f415cf09b7fe8c6ce170ef944061e7788d73c1f5835652d8afe9939b01905d5aa7c48c3a00011171584009eef9ccd06b511205d08969d2eac1305f635ea4dc417a06531a120c68a1e1559a9739daa91438517cd054889e31d95877c8b81ae3391d0382569edbffc0b11b08a101a401022002215830c76f2283dda95cd49b0ed9e733d2904474e37216f124e13d2c9ab4cf01021c49ad9cabb3d0b97499aef2f0ab313fa02822583026bc1f83451b5c8962a75caff73588d4400a6296436154fb343c393e91048a6c7bcbadc83cd8a5f26feae883156f92a15860e3534eb9de1a029648c154a410b94ebd3147e2bda70e94a43b9af7e7373bbe04612f415503e96c9cc0308d2a1ab9a013586f74ce6dae98556d9d314c68f39daeef030a41d03e49b2903f64f12dbd56ba90963fe464e98510c45b194f245bbf2a3a00011170a1627030a2190111818219fde85834820158307158862be7ff7d2ae0a585b872f415cf09b7fe8c6ce170ef944061e7788d73c1f5835652d8afe9939b01905d5aa7c48c3a00011172586ea50102033822200221583064690e21801e03645c5dc3e508019a0af83f76fb23481a2d0c2aca61b6d88e5eb5885337c47d123069ebb7f96d9e676a225830db9f890b0586e7bb4254df43cba9e397ff4065627f5ce6f65b0a3002d730eaf3c3c4589297fa3eb46a95101da2274513586083778a15ee356010ebf52c5fa2fb792b6e68084a3781ad0d616561db108b273136278cab1367917547de1639e17c16d7d7953f31c4e410357d38007a62645f30d07913eb9ee8da61793df805af1f1a1ba136656f83813a663a807d4af2e1183a";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn wrap_sec1() -> [u8; 97] {
+        unhex(WRAP_SEC1).try_into().unwrap()
+    }
+
+    #[test]
+    fn wrap_cose_key_matches_cmvm_dice() {
+        assert_eq!(wrap_cose_key(&wrap_sec1()), unhex(WRAP_COSE));
+        // The alias form differs only by the ES384 label: {1: 2, 3: -35, ...}.
+        let alias = cose_key(&wrap_sec1());
+        assert_eq!(&alias[..5], &[0xa5, 0x01, 0x02, 0x03, 0x38]);
+        assert_eq!(&alias[6..], &unhex(WRAP_COSE)[3..]);
+    }
+
+    #[test]
+    fn cnf_claim_is_rfc8747_cose_key_form() {
+        let nonce = [9u8; 32];
+        let pm = unhex(PARTITION_MEASUREMENT);
+        let rd = unhex(REPORT_DATA);
+        let with = nested_claims(&nonce, &pm, &rd, Some(&wrap_sec1()));
+        let without = nested_claims(&nonce, &pm, &rd, None);
+        // 8: {1: COSE_Key}, appended after the three claims, map head 3 -> 4.
+        let mut expected = without.clone();
+        expected[0] = 0xa4;
+        expected.extend_from_slice(&[0x08, 0xa1, 0x01]);
+        expected.extend_from_slice(&unhex(WRAP_COSE));
+        assert_eq!(without[0], 0xa3);
+        assert_eq!(with, expected);
+    }
+
+    #[test]
+    fn nested_and_monitor_tokens_match_cmvm_dice() {
+        use crate::dice::{alias_key, partition_cdi, sec1};
+        let monitor_cdi = [7u8; 48];
+        let nonce = [9u8; 32];
+        let pm: [u8; 48] = unhex(PARTITION_MEASUREMENT).try_into().unwrap();
+        let partition_alias = alias_key(&partition_cdi(&monitor_cdi, &pm).unwrap()).unwrap();
+        let nested = nested_token(
+            &partition_alias,
+            &nonce,
+            &pm,
+            &unhex(REPORT_DATA),
+            Some(&wrap_sec1()),
+        );
+        assert_eq!(nested, unhex(NESTED));
+        let token = monitor_token(
+            &alias_key(&monitor_cdi).unwrap(),
+            &nonce,
+            &unhex(MONITOR_MEASUREMENT),
+            "p0",
+            &pm,
+            &sec1(&partition_alias).unwrap(),
+            &nested,
+        );
+        assert_eq!(token, unhex(MONITOR_TOKEN));
     }
 }

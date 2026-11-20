@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use core::mem::size_of;
 
 use hkdf::Hkdf;
-use p384::ecdsa::SigningKey;
+use p384::ecdsa::{SigningKey, VerifyingKey};
 use sha2::{Digest, Sha384, Sha512};
 use zerocopy::{FromBytes, IntoBytes};
 use zeroize::Zeroizing;
@@ -46,6 +46,9 @@ pub const REPORT_DATA_TAG: &[u8] = b"cmvm monitor alias v1\0";
 
 /// Size of the uncompressed SEC1 encoding of a P-384 public key.
 pub const ALIAS_PUBLIC_SIZE: usize = 97;
+
+/// Size of a partition wrap public key: an uncompressed SEC1 P-384 point.
+pub const WRAP_PUBLIC_SIZE: usize = 97;
 
 /// Size of an SNP attestation report.
 pub const REPORT_SIZE: usize = size_of::<AttestationReport>();
@@ -104,10 +107,29 @@ fn sec1(key: &SigningKey) -> Result<[u8; ALIAS_PUBLIC_SIZE], SvsmError> {
         .map_err(|_| SvsmError::InvalidFormat)
 }
 
+/// Check a partition wrap public key before it goes into a signed token: an
+/// uncompressed SEC1 point on P-384 that is not the identity. The SVSM encodes
+/// the COSE_Key itself from the checked point, so the guest never puts raw
+/// CBOR into a token the SVSM signs.
+pub fn check_wrap_key(sec1: &[u8; WRAP_PUBLIC_SIZE]) -> Result<(), SvsmError> {
+    if sec1[0] != 0x04 {
+        return Err(SvsmError::InvalidFormat);
+    }
+    VerifyingKey::from_sec1_bytes(sec1)
+        .map(|_| ())
+        .map_err(|_| SvsmError::InvalidFormat)
+}
+
 /// Measure, derive and sign for one partition: the monitor token, carrying the
 /// partition's nested token and the monitor's endorsement of its measurement
 /// and alias key. With [`root_endorsement`] it is a complete version 2
 /// evidence bundle.
+///
+/// With `wrap_key`, the nested token also carries the partition's wrap key in
+/// its `cnf` claim (RFC 8747, F0X-898), so the token names the key a KMS
+/// releases to and not only its hash in `report_data`. `report_data` is still
+/// the caller's, unchecked here: a verifier requires it to be
+/// `SHA-512(nonce || COSE_Key)` for the same key.
 ///
 /// Prototype limit: the nested token is signed here, in VMPL0, with the alias
 /// key derived for `partition_measurement`. In the eventual design the
@@ -118,12 +140,22 @@ pub fn attest_partition(
     report_data: &[u8],
     partition_id: &str,
     partition_measurement: &[u8; 48],
+    wrap_key: Option<&[u8; WRAP_PUBLIC_SIZE]>,
 ) -> Result<Vec<u8>, SvsmError> {
+    if let Some(w) = wrap_key {
+        check_wrap_key(w)?;
+    }
     let (cdi, monitor_measurement) = monitor_cdi_and_measurement()?;
     let monitor_alias = alias_key(&cdi)?;
     let partition = partition_cdi(&cdi, partition_measurement)?;
     let partition_alias = alias_key(&partition)?;
-    let nested = eat::nested_token(&partition_alias, nonce, partition_measurement, report_data);
+    let nested = eat::nested_token(
+        &partition_alias,
+        nonce,
+        partition_measurement,
+        report_data,
+        wrap_key,
+    );
     Ok(eat::monitor_token(
         &monitor_alias,
         nonce,
@@ -185,6 +217,23 @@ mod tests {
             a.verifying_key(),
             alias_key(&[8u8; 48]).unwrap().verifying_key()
         );
+    }
+
+    #[test]
+    fn check_wrap_key_takes_only_uncompressed_points_on_p384() {
+        let good = SigningKey::from_slice(&[7u8; 48])
+            .unwrap()
+            .verifying_key()
+            .to_sec1_point(false);
+        let good: [u8; WRAP_PUBLIC_SIZE] = good.as_bytes().try_into().unwrap();
+        assert!(check_wrap_key(&good).is_ok());
+        let mut off_curve = good;
+        off_curve[WRAP_PUBLIC_SIZE - 1] ^= 1;
+        assert!(check_wrap_key(&off_curve).is_err());
+        let mut wrong_tag = good;
+        wrong_tag[0] = 0x02;
+        assert!(check_wrap_key(&wrong_tag).is_err());
+        assert!(check_wrap_key(&[0u8; WRAP_PUBLIC_SIZE]).is_err());
     }
 
     #[test]
