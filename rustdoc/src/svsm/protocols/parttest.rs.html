@@ -1,0 +1,690 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `kernel/src/protocols/parttest.rs`."><title>parttest.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1a91846b.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="svsm" data-themes="" data-resource-suffix="" data-rustdoc-version="1.88.0 (6b00bc388 2025-06-23)" data-channel="1.88.0" data-search-js="search-f7877310.js" data-settings-js="settings-5514c975.js" ><script src="../../../static.files/storage-4e99c027.js"></script><script defer src="../../../static.files/src-script-63605ae7.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-7ef8a74a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-893ab5e7.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer"></div><main><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><h1><div class="sub-heading">svsm/protocols/</div>parttest.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">// SPDX-License-Identifier: MIT OR Apache-2.0
+<a href=#2 id=2 data-nosnippet>2</a>//
+<a href=#3 id=3 data-nosnippet>3</a>// Copyright (c) 2026 Fr0ntierX
+<a href=#4 id=4 data-nosnippet>4</a>//
+<a href=#5 id=5 data-nosnippet>5</a>// Partition-isolation test protocol (F0X-78, idea B).
+<a href=#6 id=6 data-nosnippet>6</a>//
+<a href=#7 id=7 data-nosnippet>7</a>// B isolates partitions by separate page tables inside one VMPL, and rests on
+<a href=#8 id=8 data-nosnippet>8</a>// one invariant: the SVSM owns a partition's page tables and the partition
+<a href=#9 id=9 data-nosnippet>9</a>// cannot write its own page-table pages. That is RMP write-protection enforced
+<a href=#10 id=10 data-nosnippet>10</a>// against the partition's VMPL, and it is the half of the invariant that cannot
+<a href=#11 id=11 data-nosnippet>11</a>// be tested from inside the guest.
+<a href=#12 id=12 data-nosnippet>12</a>//
+<a href=#13 id=13 data-nosnippet>13</a>// The guest side is already settled on silicon: a partition at VMPL2 cannot
+<a href=#14 id=14 data-nosnippet>14</a>// RMPADJUST VMPL2, VMPL1 or VMPL0 (all FAIL_PERMISSION), so it cannot re-grant
+<a href=#15 id=15 data-nosnippet>15</a>// itself access the SVSM revoked. What was missing is proof that the revocation
+<a href=#16 id=16 data-nosnippet>16</a>// is actually enforced when the partition then touches the page. This protocol
+<a href=#17 id=17 data-nosnippet>17</a>// supplies the VMPL0 half so a guest prober can complete the test:
+<a href=#18 id=18 data-nosnippet>18</a>//
+<a href=#19 id=19 data-nosnippet>19</a>//   1. guest allocates a page it owns and writes to it              (succeeds)
+<a href=#20 id=20 data-nosnippet>20</a>//   2. guest calls REVOKE_WRITE with that GPA
+<a href=#21 id=21 data-nosnippet>21</a>//   3. guest writes again                                           (must fault)
+<a href=#22 id=22 data-nosnippet>22</a>//   4. guest calls GRANT_WRITE to restore, so the page is reusable
+<a href=#23 id=23 data-nosnippet>23</a>//
+<a href=#24 id=24 data-nosnippet>24</a>// Read is deliberately left in place by REVOKE_WRITE rather than dropping all
+<a href=#25 id=25 data-nosnippet>25</a>// access. Page tables have to stay readable for the hardware walker at the
+<a href=#26 id=26 data-nosnippet>26</a>// partition's VMPL, so read-only is the configuration B actually runs, and
+<a href=#27 id=27 data-nosnippet>27</a>// no-access would test a stronger property than the design needs.
+<a href=#28 id=28 data-nosnippet>28</a>//
+<a href=#29 id=29 data-nosnippet>29</a>// This is a test surface that can hand a guest a way to make its own pages
+<a href=#30 id=30 data-nosnippet>30</a>// unwritable, so it is behind the `parttest` cargo feature and must never be
+<a href=#31 id=31 data-nosnippet>31</a>// enabled in a shipping build. It is not registered in the protocol dispatch
+<a href=#32 id=32 data-nosnippet>32</a>// unless that feature is on.
+<a href=#33 id=33 data-nosnippet>33</a>
+<a href=#34 id=34 data-nosnippet>34</a></span><span class="kw">extern crate </span>alloc;
+<a href=#35 id=35 data-nosnippet>35</a>
+<a href=#36 id=36 data-nosnippet>36</a><span class="kw">use </span><span class="kw">crate</span>::address::{Address, PhysAddr};
+<a href=#37 id=37 data-nosnippet>37</a><span class="kw">use </span><span class="kw">crate</span>::cpu::msr::rdtsc;
+<a href=#38 id=38 data-nosnippet>38</a><span class="kw">use </span><span class="kw">crate</span>::error::SvsmError;
+<a href=#39 id=39 data-nosnippet>39</a><span class="kw">use </span><span class="kw">crate</span>::greq::pld_key::SnpDerivedKeyRequest;
+<a href=#40 id=40 data-nosnippet>40</a><span class="kw">use </span><span class="kw">crate</span>::greq::services::get_derived_key;
+<a href=#41 id=41 data-nosnippet>41</a><span class="kw">use </span><span class="kw">crate</span>::mm::{PerCPUPageMappingGuard, valid_phys_region};
+<a href=#42 id=42 data-nosnippet>42</a><span class="kw">use </span><span class="kw">crate</span>::protocols::RequestParams;
+<a href=#43 id=43 data-nosnippet>43</a><span class="kw">use </span><span class="kw">crate</span>::protocols::core::{
+<a href=#44 id=44 data-nosnippet>44</a>    PVALIDATE_LOCK, RETIRE_DEFAULT_INUSE_DEADLINE, RetireError, RetireOptions, core_create_vcpu,
+<a href=#45 id=45 data-nosnippet>45</a>    retire_guest_vcpu,
+<a href=#46 id=46 data-nosnippet>46</a>};
+<a href=#47 id=47 data-nosnippet>47</a><span class="kw">use </span><span class="kw">crate</span>::protocols::errors::SvsmReqError;
+<a href=#48 id=48 data-nosnippet>48</a><span class="kw">use </span><span class="kw">crate</span>::protocols::faultinj::{FAULT_BAD_VMPL, Fault, FaultStep, fault_arm};
+<a href=#49 id=49 data-nosnippet>49</a><span class="kw">use </span><span class="kw">crate</span>::protocols::watchdog::{
+<a href=#50 id=50 data-nosnippet>50</a>    RetryPolicy, SlotState, WATCHDOG_MAX_PAGES, WatchdogError, watchdog_arm, watchdog_disarm,
+<a href=#51 id=51 data-nosnippet>51</a>    watchdog_status, watchdog_tick,
+<a href=#52 id=52 data-nosnippet>52</a>};
+<a href=#53 id=53 data-nosnippet>53</a><span class="kw">use </span><span class="kw">crate</span>::sev::ghcb::{GhcbError, with_current_ghcb};
+<a href=#54 id=54 data-nosnippet>54</a><span class="kw">use </span><span class="kw">crate</span>::sev::utils::{RMPFlags, rmp_adjust};
+<a href=#55 id=55 data-nosnippet>55</a><span class="kw">use </span><span class="kw">crate</span>::types::{PAGE_SIZE, PageSize};
+<a href=#56 id=56 data-nosnippet>56</a><span class="kw">use </span><span class="kw">crate</span>::utils::MemoryRegion;
+<a href=#57 id=57 data-nosnippet>57</a><span class="kw">use </span>alloc::vec::Vec;
+<a href=#58 id=58 data-nosnippet>58</a><span class="kw">use </span>sha2::{Digest, Sha384};
+<a href=#59 id=59 data-nosnippet>59</a>
+<a href=#60 id=60 data-nosnippet>60</a><span class="doccomment">/// Drop write for the guest VMPL on one 4K page, leaving read in place.
+<a href=#61 id=61 data-nosnippet>61</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_REVOKE_WRITE: u32 = <span class="number">0</span>;
+<a href=#62 id=62 data-nosnippet>62</a><span class="doccomment">/// Restore read/write/execute for the guest VMPL on one 4K page.
+<a href=#63 id=63 data-nosnippet>63</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_GRANT_WRITE: u32 = <span class="number">1</span>;
+<a href=#64 id=64 data-nosnippet>64</a><span class="doccomment">/// Do nothing and return success. Times the guest -&gt; VMGEXIT -&gt; hypervisor -&gt;
+<a href=#65 id=65 data-nosnippet>65</a>/// VMPL0 -&gt; back round trip with no work inside it, which is the relay cost any
+<a href=#66 id=66 data-nosnippet>66</a>/// hypervisor-mediated partition switch has to pay (F0X-93 vmsa_reentry). VEIL
+<a href=#67 id=67 data-nosnippet>67</a>/// reports 7,135 cycles for a relayed domain switch and NestedSGX 32-34k, so
+<a href=#68 id=68 data-nosnippet>68</a>/// this is the term to compare against those.
+<a href=#69 id=69 data-nosnippet>69</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_NOOP: u32 = <span class="number">2</span>;
+<a href=#70 id=70 data-nosnippet>70</a><span class="doccomment">/// Drop every permission for the guest VMPL on one 4K page, read included.
+<a href=#71 id=71 data-nosnippet>71</a>/// REVOKE_WRITE keeps read because B runs read-only: page tables must stay
+<a href=#72 id=72 data-nosnippet>72</a>/// readable for the hardware walker at the partition's VMPL. This exists only
+<a href=#73 id=73 data-nosnippet>73</a>/// to tell whether the wedged-vCPU behaviour is specific to read-only or is
+<a href=#74 id=74 data-nosnippet>74</a>/// general to any RMP permission violation (F0X-301, experiment 2).
+<a href=#75 id=75 data-nosnippet>75</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_REVOKE_ALL: u32 = <span class="number">3</span>;
+<a href=#76 id=76 data-nosnippet>76</a><span class="doccomment">/// Ask the PSP for a VMPL0 derived key and return the first 24 bytes of its
+<a href=#77 id=77 data-nosnippet>77</a>/// SHA-384 in rcx, rdx and r8. Input: rcx = GUEST_FIELD_SELECT, rdx =
+<a href=#78 id=78 data-nosnippet>78</a>/// ROOT_KEY_SELECT. This exists to check on silicon that the key the DICE
+<a href=#79 id=79 data-nosnippet>79</a>/// root will use (F0X-80) is stable for one image and changes with the
+<a href=#80 id=80 data-nosnippet>80</a>/// selected fields. The key itself is the monitor's root secret and never
+<a href=#81 id=81 data-nosnippet>81</a>/// leaves VMPL0; only a one-way hash does, and only in parttest builds.
+<a href=#82 id=82 data-nosnippet>82</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_DERIVED_KEY_HASH: u32 = <span class="number">4</span>;
+<a href=#83 id=83 data-nosnippet>83</a><span class="doccomment">/// Write the monitor's hardware root endorsement (F0X-80) to the 4K guest
+<a href=#84 id=84 data-nosnippet>84</a>/// page at rcx: the alias public key (97-byte SEC1 point) followed by the
+<a href=#85 id=85 data-nosnippet>85</a>/// VMPL0 attestation report that binds it in REPORT_DATA. A verifier checks
+<a href=#86 id=86 data-nosnippet>86</a>/// the report against the VCEK chain and recomputes REPORT_DATA from the key.
+<a href=#87 id=87 data-nosnippet>87</a>/// Only public values leave VMPL0; the CDI and the alias private key do not.
+<a href=#88 id=88 data-nosnippet>88</a></span><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#89 id=89 data-nosnippet>89</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_DICE_ROOT: u32 = <span class="number">5</span>;
+<a href=#90 id=90 data-nosnippet>90</a><span class="doccomment">/// Measure a guest memory region as a partition and return its EAT
+<a href=#91 id=91 data-nosnippet>91</a>/// (F0X-80): the monitor token, signed by the hardware-rooted monitor alias,
+<a href=#92 id=92 data-nosnippet>92</a>/// carrying the partition's nested token and the monitor's endorsement of the
+<a href=#93 id=93 data-nosnippet>93</a>/// partition's measurement and alias key. With call 5's root it is a complete
+<a href=#94 id=94 data-nosnippet>94</a>/// version 2 evidence bundle.
+<a href=#95 id=95 data-nosnippet>95</a>///
+<a href=#96 id=96 data-nosnippet>96</a>/// rcx is a 4K request page: nonce (32 bytes), REPORT_DATA (64), region GPA
+<a href=#97 id=97 data-nosnippet>97</a>/// (u64), region page count (u32, at most `DICE_ATTEST_MAX_PAGES`), partition
+<a href=#98 id=98 data-nosnippet>98</a>/// ID length (u32, at most `DICE_ATTEST_MAX_ID`), then the ID in UTF-8. rdx
+<a href=#99 id=99 data-nosnippet>99</a>/// is a 4K output page that gets the token length (u32) followed by the token.
+<a href=#100 id=100 data-nosnippet>100</a>///
+<a href=#101 id=101 data-nosnippet>101</a>/// r8 = flags, 0 for none. With `DICE_ATTEST_WRAP_KEY` the request page also
+<a href=#102 id=102 data-nosnippet>102</a>/// holds the partition's wrap public key (F0X-898), a 97-byte uncompressed
+<a href=#103 id=103 data-nosnippet>103</a>/// SEC1 P-384 point at `DICE_ATTEST_WRAP_OFFSET`, and the nested token carries
+<a href=#104 id=104 data-nosnippet>104</a>/// it as a COSE_Key in its `cnf` claim. The point must be on the curve. A
+<a href=#105 id=105 data-nosnippet>105</a>/// verifier also requires REPORT_DATA to be SHA-512(nonce || that COSE_Key).
+<a href=#106 id=106 data-nosnippet>106</a></span><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#107 id=107 data-nosnippet>107</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_DICE_ATTEST: u32 = <span class="number">6</span>;
+<a href=#108 id=108 data-nosnippet>108</a><span class="doccomment">/// Retire a guest vCPU and revoke a partition's pages (F0X-75 watchdog
+<a href=#109 id=109 data-nosnippet>109</a>/// reclaim), through `core::retire_guest_vcpu`. The guest must take the
+<a href=#110 id=110 data-nosnippet>110</a>/// target CPU offline first.
+<a href=#111 id=111 data-nosnippet>111</a>///
+<a href=#112 id=112 data-nosnippet>112</a>/// In: rcx = the target's VMSA GPA. rdx = GPA of a 4K page list, or 0 for
+<a href=#113 id=113 data-nosnippet>113</a>/// none: a u64 count (at most `RETIRE_MAX_PAGES`) followed by that many 4K
+<a href=#114 id=114 data-nosnippet>114</a>/// GPAs. r8 bits 0-62 = FAIL_INUSE deadline in TSC ticks (0 for the
+<a href=#115 id=115 data-nosnippet>115</a>/// default), bit 63 = retire even if the host refuses AP_DESTROY.
+<a href=#116 id=116 data-nosnippet>116</a>///
+<a href=#117 id=117 data-nosnippet>117</a>/// Out, on success and on every error: rcx = AP_DESTROY ticks, rdx = ticks
+<a href=#118 id=118 data-nosnippet>118</a>/// from the first RMPADJUST on the VMSA to success, r8 = pages revoked
+<a href=#119 id=119 data-nosnippet>119</a>/// (bits 0-15) | FAIL_INUSE retries (16-47) | AP_DESTROY refused (63).
+<a href=#120 id=120 data-nosnippet>120</a>///
+<a href=#121 id=121 data-nosnippet>121</a>/// Errors: INVALID_PARAMETER (not a guest-created in-use VMSA, the caller's
+<a href=#122 id=122 data-nosnippet>122</a>/// own vCPU, or a bad list), INVALID_ADDRESS (a list entry is not a guest
+<a href=#123 id=123 data-nosnippet>123</a>/// page or is a VMSA or calling area, entry index in rdx), BUSY (FAIL_INUSE
+<a href=#124 id=124 data-nosnippet>124</a>/// past the deadline), and the protocol codes below, whose detail goes in
+<a href=#125 id=125 data-nosnippet>125</a>/// rdx. See `RetireError` for what each leaves behind.
+<a href=#126 id=126 data-nosnippet>126</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_RETIRE_VCPU: u32 = <span class="number">7</span>;
+<a href=#127 id=127 data-nosnippet>127</a><span class="kw">const </span>RETIRE_MAX_PAGES: usize = PAGE_SIZE / <span class="number">8 </span>- <span class="number">1</span>;
+<a href=#128 id=128 data-nosnippet>128</a><span class="doccomment">/// Host refused AP_DESTROY, nothing revoked. rdx = SW_EXITINFO1.
+<a href=#129 id=129 data-nosnippet>129</a></span><span class="kw">const </span>RETIRE_ERR_AP_DESTROY: u64 = <span class="number">0x100</span>;
+<a href=#130 id=130 data-nosnippet>130</a><span class="doccomment">/// RMPADJUST on the VMSA failed, nothing revoked. rdx = status.
+<a href=#131 id=131 data-nosnippet>131</a></span><span class="kw">const </span>RETIRE_ERR_VMSA_ADJUST: u64 = <span class="number">0x101</span>;
+<a href=#132 id=132 data-nosnippet>132</a><span class="doccomment">/// Retired, but revoking a partition page failed. rdx = index | status &lt;&lt; 32.
+<a href=#133 id=133 data-nosnippet>133</a></span><span class="kw">const </span>RETIRE_ERR_PAGE_REVOKE: u64 = <span class="number">0x102</span>;
+<a href=#134 id=134 data-nosnippet>134</a><span class="doccomment">/// Retired and pages revoked, but the scrubbed VMSA page stays revoked from
+<a href=#135 id=135 data-nosnippet>135</a>/// the guest. rdx = status.
+<a href=#136 id=136 data-nosnippet>136</a></span><span class="kw">const </span>RETIRE_ERR_VMSA_RELEASE: u64 = <span class="number">0x103</span>;
+<a href=#137 id=137 data-nosnippet>137</a><span class="doccomment">/// The VMSA page could not be mapped. The host was already asked to halt it.
+<a href=#138 id=138 data-nosnippet>138</a></span><span class="kw">const </span>RETIRE_ERR_NO_MAPPING: u64 = <span class="number">0x104</span>;
+<a href=#139 id=139 data-nosnippet>139</a><span class="doccomment">/// Start a guest-built VMSA on another vCPU (F0X-75 watchdog tests). In: rcx
+<a href=#140 id=140 data-nosnippet>140</a>/// = VMSA GPA, rdx = calling area GPA, r8 = APIC ID, as CREATE_VCPU. Runs
+<a href=#141 id=141 data-nosnippet>141</a>/// CREATE_VCPU's checks and registration, then sends GHCB AP_CREATE at the
+<a href=#142 id=142 data-nosnippet>142</a>/// guest VMPL from VMPL0, so the guest kernel needs no GHCB access of its own
+<a href=#143 id=143 data-nosnippet>143</a>/// to hand a vCPU it took offline to a partition payload. If AP_CREATE fails
+<a href=#144 id=144 data-nosnippet>144</a>/// (`START_ERR_AP_CREATE`) the VMSA stays registered but never ran, and call
+<a href=#145 id=145 data-nosnippet>145</a>/// 7 retires it.
+<a href=#146 id=146 data-nosnippet>146</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_START_VCPU: u32 = <span class="number">8</span>;
+<a href=#147 id=147 data-nosnippet>147</a><span class="doccomment">/// Arm a watchdog slot (`watchdog::watchdog_arm`). rcx = 4K request page:
+<a href=#148 id=148 data-nosnippet>148</a>/// VMSA GPA, heartbeat GPA (8-byte aligned), deadline in TSC ticks, page
+<a href=#149 id=149 data-nosnippet>149</a>/// count (at most `WATCHDOG_MAX_PAGES`), then that many 4K GPAs to revoke on
+<a href=#150 id=150 data-nosnippet>150</a>/// reclaim, all u64. rdx = retry policy (`watchdog::RetryPolicy`): 0 for the
+<a href=#151 id=151 data-nosnippet>151</a>/// default, or `ARM_POLICY_SET` with bits 0-15 = plain retries and
+<a href=#152 id=152 data-nosnippet>152</a>/// `ARM_POLICY_NO_FORCE` to never force. r8 = with `ARM_POLICY_SET`, the
+<a href=#153 id=153 data-nosnippet>153</a>/// retry window in TSC ticks (0 for none). Out: rcx = slot index.
+<a href=#154 id=154 data-nosnippet>154</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_WATCHDOG_ARM: u32 = <span class="number">9</span>;
+<a href=#155 id=155 data-nosnippet>155</a><span class="doccomment">/// One watchdog period (`watchdog::watchdog_tick`). Only the first vCPU that
+<a href=#156 id=156 data-nosnippet>156</a>/// ticks may tick again. Out: rcx = armed slots checked, rdx = slots whose
+<a href=#157 id=157 data-nosnippet>157</a>/// vCPU was retired in this tick (bitmask), r8 = VMPL0 ticks spent (bits
+<a href=#158 id=158 data-nosnippet>158</a>/// 0-31) | slots that finished with an error (bitmask) &lt;&lt; 32 | slots whose
+<a href=#159 id=159 data-nosnippet>159</a>/// retire failed and is retried next tick (bitmask) &lt;&lt; 48. A slot retired
+<a href=#160 id=160 data-nosnippet>160</a>/// with a clean-up error (`ReclaimedPartly`) is in both of the first two.
+<a href=#161 id=161 data-nosnippet>161</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_WATCHDOG_TICK: u32 = <span class="number">10</span>;
+<a href=#162 id=162 data-nosnippet>162</a><span class="doccomment">/// Write one slot's record to a 4K guest page. In: rcx = slot, rdx = page.
+<a href=#163 id=163 data-nosnippet>163</a>/// The record is `WATCHDOG_STATUS_WORDS` u64s, laid out in `watchdog_status`.
+<a href=#164 id=164 data-nosnippet>164</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_WATCHDOG_STATUS: u32 = <span class="number">11</span>;
+<a href=#165 id=165 data-nosnippet>165</a><span class="doccomment">/// Free a slot that is armed, reclaimed or failed. In: rcx = slot.
+<a href=#166 id=166 data-nosnippet>166</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_WATCHDOG_DISARM: u32 = <span class="number">12</span>;
+<a href=#167 id=167 data-nosnippet>167</a><span class="doccomment">/// Arm one injected failure at a named step of the retire, START_VCPU or
+<a href=#168 id=168 data-nosnippet>168</a>/// watchdog paths (`faultinj`), so their error paths can be driven on
+<a href=#169 id=169 data-nosnippet>169</a>/// hardware. In: rcx bits 0-11 = `FaultStep` code, or 0 to clear, bits 12-63
+<a href=#170 id=170 data-nosnippet>170</a>/// = a page-aligned VMSA GPA the fault is keyed on (0 for any target; only
+<a href=#171 id=171 data-nosnippet>171</a>/// the retire steps name a target). rdx = the status the
+<a href=#172 id=172 data-nosnippet>172</a>/// failing step returns, where it returns one (for FAIL_INUSE, how many fake
+<a href=#173 id=173 data-nosnippet>173</a>/// results the retire sees, u64::MAX for all of them). r8 bits 0-31 = hits at the
+<a href=#174 id=174 data-nosnippet>174</a>/// step to let through first, bits 32-63 = how many hits fail (0 means 1).
+<a href=#175 id=175 data-nosnippet>175</a>/// Out: rcx = the step of the fault this replaces (0 if none), rdx = how
+<a href=#176 id=176 data-nosnippet>176</a>/// many times it fired, r8 = failures it had left.
+<a href=#177 id=177 data-nosnippet>177</a></span><span class="kw">const </span>SVSM_REQ_PARTTEST_FAULT_INJECT: u32 = <span class="number">13</span>;
+<a href=#178 id=178 data-nosnippet>178</a><span class="doccomment">/// AP_CREATE refused by the host. rdx = SW_EXITINFO1, or u64::MAX if the GHCB
+<a href=#179 id=179 data-nosnippet>179</a>/// answer was malformed.
+<a href=#180 id=180 data-nosnippet>180</a></span><span class="kw">const </span>START_ERR_AP_CREATE: u64 = <span class="number">0x110</span>;
+<a href=#181 id=181 data-nosnippet>181</a><span class="doccomment">/// The tick came from a vCPU other than the watchdog vCPU.
+<a href=#182 id=182 data-nosnippet>182</a></span><span class="kw">const </span>WATCHDOG_ERR_NOT_WATCHDOG_CPU: u64 = <span class="number">0x120</span>;
+<a href=#183 id=183 data-nosnippet>183</a><span class="doccomment">/// No free slot.
+<a href=#184 id=184 data-nosnippet>184</a></span><span class="kw">const </span>WATCHDOG_ERR_FULL: u64 = <span class="number">0x121</span>;
+<a href=#185 id=185 data-nosnippet>185</a><span class="doccomment">/// The VMSA is already watched.
+<a href=#186 id=186 data-nosnippet>186</a></span><span class="kw">const </span>WATCHDOG_ERR_ALREADY_WATCHED: u64 = <span class="number">0x122</span>;
+<a href=#187 id=187 data-nosnippet>187</a><span class="kw">const </span>WATCHDOG_STATUS_WORDS: usize = <span class="number">26</span>;
+<a href=#188 id=188 data-nosnippet>188</a><span class="doccomment">/// ARM rdx: a retry policy is given (otherwise the default).
+<a href=#189 id=189 data-nosnippet>189</a></span><span class="kw">const </span>ARM_POLICY_SET: u64 = <span class="number">1 </span>&lt;&lt; <span class="number">63</span>;
+<a href=#190 id=190 data-nosnippet>190</a><span class="doccomment">/// ARM rdx: never force, end `Failed` when the plain retries are used up.
+<a href=#191 id=191 data-nosnippet>191</a></span><span class="kw">const </span>ARM_POLICY_NO_FORCE: u64 = <span class="number">1 </span>&lt;&lt; <span class="number">62</span>;
+<a href=#192 id=192 data-nosnippet>192</a><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#193 id=193 data-nosnippet>193</a></span><span class="kw">const </span>DICE_ATTEST_MAX_PAGES: usize = <span class="number">256</span>;
+<a href=#194 id=194 data-nosnippet>194</a><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#195 id=195 data-nosnippet>195</a></span><span class="kw">const </span>DICE_ATTEST_MAX_ID: usize = <span class="number">64</span>;
+<a href=#196 id=196 data-nosnippet>196</a><span class="doccomment">/// Call 6 r8 flag: the request carries a wrap key for `cnf`.
+<a href=#197 id=197 data-nosnippet>197</a></span><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#198 id=198 data-nosnippet>198</a></span><span class="kw">const </span>DICE_ATTEST_WRAP_KEY: u64 = <span class="number">1</span>;
+<a href=#199 id=199 data-nosnippet>199</a><span class="doccomment">/// Where the wrap key sits in the call 6 request page, after the longest ID.
+<a href=#200 id=200 data-nosnippet>200</a></span><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#201 id=201 data-nosnippet>201</a></span><span class="kw">const </span>DICE_ATTEST_WRAP_OFFSET: usize = <span class="number">112 </span>+ DICE_ATTEST_MAX_ID;
+<a href=#202 id=202 data-nosnippet>202</a>
+<a href=#203 id=203 data-nosnippet>203</a><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#204 id=204 data-nosnippet>204</a></span><span class="kw">fn </span>dice_root(params: <span class="kw-2">&amp;</span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#205 id=205 data-nosnippet>205</a>    <span class="kw">use </span><span class="kw">crate</span>::dice::{ALIAS_PUBLIC_SIZE, root_endorsement};
+<a href=#206 id=206 data-nosnippet>206</a>    <span class="kw">use </span><span class="kw">crate</span>::greq::pld_report::AttestationReport;
+<a href=#207 id=207 data-nosnippet>207</a>
+<a href=#208 id=208 data-nosnippet>208</a>    <span class="kw">let </span>paddr = PhysAddr::from(params.rcx);
+<a href=#209 id=209 data-nosnippet>209</a>    <span class="kw">if </span>!paddr.is_page_aligned() {
+<a href=#210 id=210 data-nosnippet>210</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#211 id=211 data-nosnippet>211</a>    }
+<a href=#212 id=212 data-nosnippet>212</a>    <span class="kw">let </span>(public, report) = root_endorsement().map_err(|e| {
+<a href=#213 id=213 data-nosnippet>213</a>        <span class="macro">log::info!</span>(<span class="string">"parttest: DICE root endorsement failed: {e:?}"</span>);
+<a href=#214 id=214 data-nosnippet>214</a>        SvsmReqError::invalid_request()
+<a href=#215 id=215 data-nosnippet>215</a>    })<span class="question-mark">?</span>;
+<a href=#216 id=216 data-nosnippet>216</a>    <span class="comment">// guest_ptr checks the region is guest memory before anything is written.
+<a href=#217 id=217 data-nosnippet>217</a>    </span><span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(paddr)<span class="question-mark">?</span>;
+<a href=#218 id=218 data-nosnippet>218</a>    guard
+<a href=#219 id=219 data-nosnippet>219</a>        .guest_ptr::&lt;[u8; ALIAS_PUBLIC_SIZE]&gt;(<span class="number">0</span>)<span class="question-mark">?
+<a href=#220 id=220 data-nosnippet>220</a>        </span>.write(public)<span class="question-mark">?</span>;
+<a href=#221 id=221 data-nosnippet>221</a>    guard
+<a href=#222 id=222 data-nosnippet>222</a>        .guest_ptr::&lt;AttestationReport&gt;(ALIAS_PUBLIC_SIZE)<span class="question-mark">?
+<a href=#223 id=223 data-nosnippet>223</a>        </span>.write(report)<span class="question-mark">?</span>;
+<a href=#224 id=224 data-nosnippet>224</a>    <span class="prelude-val">Ok</span>(())
+<a href=#225 id=225 data-nosnippet>225</a>}
+<a href=#226 id=226 data-nosnippet>226</a>
+<a href=#227 id=227 data-nosnippet>227</a><span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#228 id=228 data-nosnippet>228</a></span><span class="kw">fn </span>dice_attest(params: <span class="kw-2">&amp;</span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#229 id=229 data-nosnippet>229</a>    <span class="kw">use </span><span class="kw">crate</span>::dice::{WRAP_PUBLIC_SIZE, attest_partition, check_wrap_key};
+<a href=#230 id=230 data-nosnippet>230</a>
+<a href=#231 id=231 data-nosnippet>231</a>    <span class="kw">let </span>req_pa = PhysAddr::from(params.rcx);
+<a href=#232 id=232 data-nosnippet>232</a>    <span class="kw">let </span>out_pa = PhysAddr::from(params.rdx);
+<a href=#233 id=233 data-nosnippet>233</a>    <span class="kw">if </span>!req_pa.is_page_aligned() || !out_pa.is_page_aligned() {
+<a href=#234 id=234 data-nosnippet>234</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#235 id=235 data-nosnippet>235</a>    }
+<a href=#236 id=236 data-nosnippet>236</a>    <span class="kw">if </span>params.r8 &amp; !DICE_ATTEST_WRAP_KEY != <span class="number">0 </span>{
+<a href=#237 id=237 data-nosnippet>237</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#238 id=238 data-nosnippet>238</a>    }
+<a href=#239 id=239 data-nosnippet>239</a>    <span class="kw">let </span>with_wrap_key = params.r8 &amp; DICE_ATTEST_WRAP_KEY != <span class="number">0</span>;
+<a href=#240 id=240 data-nosnippet>240</a>
+<a href=#241 id=241 data-nosnippet>241</a>    <span class="kw">let </span>(nonce, report_data, region_pa, pages, id, wrap_key) = {
+<a href=#242 id=242 data-nosnippet>242</a>        <span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(req_pa)<span class="question-mark">?</span>;
+<a href=#243 id=243 data-nosnippet>243</a>        <span class="kw">let </span>nonce = guard.guest_ptr::&lt;[u8; <span class="number">32</span>]&gt;(<span class="number">0</span>)<span class="question-mark">?</span>.read()<span class="question-mark">?</span>;
+<a href=#244 id=244 data-nosnippet>244</a>        <span class="kw">let </span>report_data = guard.guest_ptr::&lt;[u8; <span class="number">64</span>]&gt;(<span class="number">32</span>)<span class="question-mark">?</span>.read()<span class="question-mark">?</span>;
+<a href=#245 id=245 data-nosnippet>245</a>        <span class="kw">let </span>region_pa = guard.guest_ptr::&lt;u64&gt;(<span class="number">96</span>)<span class="question-mark">?</span>.read()<span class="question-mark">?</span>;
+<a href=#246 id=246 data-nosnippet>246</a>        <span class="kw">let </span>pages = guard.guest_ptr::&lt;u32&gt;(<span class="number">104</span>)<span class="question-mark">?</span>.read()<span class="question-mark">? </span><span class="kw">as </span>usize;
+<a href=#247 id=247 data-nosnippet>247</a>        <span class="kw">let </span>id_len = guard.guest_ptr::&lt;u32&gt;(<span class="number">108</span>)<span class="question-mark">?</span>.read()<span class="question-mark">? </span><span class="kw">as </span>usize;
+<a href=#248 id=248 data-nosnippet>248</a>        <span class="kw">if </span>id_len == <span class="number">0 </span>|| id_len &gt; DICE_ATTEST_MAX_ID {
+<a href=#249 id=249 data-nosnippet>249</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#250 id=250 data-nosnippet>250</a>        }
+<a href=#251 id=251 data-nosnippet>251</a>        <span class="kw">let </span>id = guard.guest_slice::&lt;u8&gt;(<span class="number">112</span>, id_len)<span class="question-mark">?</span>.read_to_vec()<span class="question-mark">?</span>;
+<a href=#252 id=252 data-nosnippet>252</a>        <span class="kw">let </span>wrap_key = <span class="kw">if </span>with_wrap_key {
+<a href=#253 id=253 data-nosnippet>253</a>            <span class="prelude-val">Some</span>(
+<a href=#254 id=254 data-nosnippet>254</a>                guard
+<a href=#255 id=255 data-nosnippet>255</a>                    .guest_ptr::&lt;[u8; WRAP_PUBLIC_SIZE]&gt;(DICE_ATTEST_WRAP_OFFSET)<span class="question-mark">?
+<a href=#256 id=256 data-nosnippet>256</a>                    </span>.read()<span class="question-mark">?</span>,
+<a href=#257 id=257 data-nosnippet>257</a>            )
+<a href=#258 id=258 data-nosnippet>258</a>        } <span class="kw">else </span>{
+<a href=#259 id=259 data-nosnippet>259</a>            <span class="prelude-val">None
+<a href=#260 id=260 data-nosnippet>260</a>        </span>};
+<a href=#261 id=261 data-nosnippet>261</a>        (
+<a href=#262 id=262 data-nosnippet>262</a>            nonce,
+<a href=#263 id=263 data-nosnippet>263</a>            report_data,
+<a href=#264 id=264 data-nosnippet>264</a>            PhysAddr::from(region_pa),
+<a href=#265 id=265 data-nosnippet>265</a>            pages,
+<a href=#266 id=266 data-nosnippet>266</a>            id,
+<a href=#267 id=267 data-nosnippet>267</a>            wrap_key,
+<a href=#268 id=268 data-nosnippet>268</a>        )
+<a href=#269 id=269 data-nosnippet>269</a>    };
+<a href=#270 id=270 data-nosnippet>270</a>    <span class="kw">let </span>id = core::str::from_utf8(<span class="kw-2">&amp;</span>id).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#271 id=271 data-nosnippet>271</a>    <span class="comment">// A wrap key that is not a P-384 point is the caller's mistake.
+<a href=#272 id=272 data-nosnippet>272</a>    </span><span class="kw">if let </span><span class="prelude-val">Some</span>(w) = <span class="kw-2">&amp;</span>wrap_key {
+<a href=#273 id=273 data-nosnippet>273</a>        check_wrap_key(w).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#274 id=274 data-nosnippet>274</a>    }
+<a href=#275 id=275 data-nosnippet>275</a>    <span class="kw">if </span>!region_pa.is_page_aligned() || pages == <span class="number">0 </span>|| pages &gt; DICE_ATTEST_MAX_PAGES {
+<a href=#276 id=276 data-nosnippet>276</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#277 id=277 data-nosnippet>277</a>    }
+<a href=#278 id=278 data-nosnippet>278</a>
+<a href=#279 id=279 data-nosnippet>279</a>    <span class="comment">// The partition measurement is SHA-384 over the region, page by page.
+<a href=#280 id=280 data-nosnippet>280</a>    </span><span class="kw">let </span><span class="kw-2">mut </span>hash = Sha384::new();
+<a href=#281 id=281 data-nosnippet>281</a>    <span class="kw">for </span>i <span class="kw">in </span><span class="number">0</span>..pages {
+<a href=#282 id=282 data-nosnippet>282</a>        <span class="kw">let </span>pa = region_pa
+<a href=#283 id=283 data-nosnippet>283</a>            .checked_add(i * PAGE_SIZE)
+<a href=#284 id=284 data-nosnippet>284</a>            .ok_or_else(SvsmReqError::invalid_address)<span class="question-mark">?</span>;
+<a href=#285 id=285 data-nosnippet>285</a>        <span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(pa)<span class="question-mark">?</span>;
+<a href=#286 id=286 data-nosnippet>286</a>        hash.update(guard.guest_slice::&lt;u8&gt;(<span class="number">0</span>, PAGE_SIZE)<span class="question-mark">?</span>.read_to_vec()<span class="question-mark">?</span>);
+<a href=#287 id=287 data-nosnippet>287</a>    }
+<a href=#288 id=288 data-nosnippet>288</a>    <span class="kw">let </span>measurement: [u8; <span class="number">48</span>] = hash.finalize().into();
+<a href=#289 id=289 data-nosnippet>289</a>
+<a href=#290 id=290 data-nosnippet>290</a>    <span class="kw">let </span>token = attest_partition(<span class="kw-2">&amp;</span>nonce, <span class="kw-2">&amp;</span>report_data, id, <span class="kw-2">&amp;</span>measurement, wrap_key.as_ref())
+<a href=#291 id=291 data-nosnippet>291</a>        .map_err(|e| {
+<a href=#292 id=292 data-nosnippet>292</a>            <span class="macro">log::info!</span>(<span class="string">"parttest: DICE attest failed: {e:?}"</span>);
+<a href=#293 id=293 data-nosnippet>293</a>            SvsmReqError::invalid_request()
+<a href=#294 id=294 data-nosnippet>294</a>        })<span class="question-mark">?</span>;
+<a href=#295 id=295 data-nosnippet>295</a>    <span class="kw">let </span>len = u32::try_from(token.len()).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_request())<span class="question-mark">?</span>;
+<a href=#296 id=296 data-nosnippet>296</a>    <span class="kw">if </span>token.len() &gt; PAGE_SIZE - <span class="number">4 </span>{
+<a href=#297 id=297 data-nosnippet>297</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_request());
+<a href=#298 id=298 data-nosnippet>298</a>    }
+<a href=#299 id=299 data-nosnippet>299</a>    <span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(out_pa)<span class="question-mark">?</span>;
+<a href=#300 id=300 data-nosnippet>300</a>    guard.guest_ptr::&lt;u32&gt;(<span class="number">0</span>)<span class="question-mark">?</span>.write(len)<span class="question-mark">?</span>;
+<a href=#301 id=301 data-nosnippet>301</a>    guard
+<a href=#302 id=302 data-nosnippet>302</a>        .guest_slice::&lt;u8&gt;(<span class="number">4</span>, token.len())<span class="question-mark">?
+<a href=#303 id=303 data-nosnippet>303</a>        </span>.write_from_slice(<span class="kw-2">&amp;</span>token)<span class="question-mark">?</span>;
+<a href=#304 id=304 data-nosnippet>304</a>    <span class="prelude-val">Ok</span>(())
+<a href=#305 id=305 data-nosnippet>305</a>}
+<a href=#306 id=306 data-nosnippet>306</a>
+<a href=#307 id=307 data-nosnippet>307</a><span class="kw">pub const </span>PARTTEST_PROTOCOL_VERSION_MIN: u32 = <span class="number">1</span>;
+<a href=#308 id=308 data-nosnippet>308</a><span class="kw">pub const </span>PARTTEST_PROTOCOL_VERSION_MAX: u32 = <span class="number">1</span>;
+<a href=#309 id=309 data-nosnippet>309</a>
+<a href=#310 id=310 data-nosnippet>310</a><span class="doccomment">/// Maps the guest page named by rcx and applies `flags` to it for the guest
+<a href=#311 id=311 data-nosnippet>311</a>/// VMPL. The address must be 4K aligned and inside a valid guest physical
+<a href=#312 id=312 data-nosnippet>312</a>/// region, which is the same check the core PVALIDATE handler applies, so a
+<a href=#313 id=313 data-nosnippet>313</a>/// guest cannot point this at SVSM-private or hypervisor memory.
+<a href=#314 id=314 data-nosnippet>314</a></span><span class="kw">fn </span>adjust_guest_page(params: <span class="kw-2">&amp;</span>RequestParams, flags: RMPFlags) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#315 id=315 data-nosnippet>315</a>    <span class="kw">let </span>paddr = PhysAddr::from(params.rcx);
+<a href=#316 id=316 data-nosnippet>316</a>
+<a href=#317 id=317 data-nosnippet>317</a>    <span class="kw">if </span>!paddr.is_page_aligned() {
+<a href=#318 id=318 data-nosnippet>318</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#319 id=319 data-nosnippet>319</a>    }
+<a href=#320 id=320 data-nosnippet>320</a>
+<a href=#321 id=321 data-nosnippet>321</a>    <span class="kw">let </span>region =
+<a href=#322 id=322 data-nosnippet>322</a>        MemoryRegion::checked_new(paddr, PAGE_SIZE).ok_or_else(SvsmReqError::invalid_address)<span class="question-mark">?</span>;
+<a href=#323 id=323 data-nosnippet>323</a>    <span class="kw">if </span>!valid_phys_region(<span class="kw-2">&amp;</span>region) {
+<a href=#324 id=324 data-nosnippet>324</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_address());
+<a href=#325 id=325 data-nosnippet>325</a>    }
+<a href=#326 id=326 data-nosnippet>326</a>
+<a href=#327 id=327 data-nosnippet>327</a>    <span class="comment">// Serialize against PVALIDATE and CREATE_VCPU, which change RMP state on
+<a href=#328 id=328 data-nosnippet>328</a>    // guest pages under this lock. Without it a concurrent CREATE_VCPU on the
+<a href=#329 id=329 data-nosnippet>329</a>    // same page could see its permissions change between its own steps.
+<a href=#330 id=330 data-nosnippet>330</a>    </span><span class="kw">let </span>_lock = PVALIDATE_LOCK.lock_write();
+<a href=#331 id=331 data-nosnippet>331</a>
+<a href=#332 id=332 data-nosnippet>332</a>    <span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(paddr)<span class="question-mark">?</span>;
+<a href=#333 id=333 data-nosnippet>333</a>    <span class="kw">let </span>vaddr = guard.virt_addr();
+<a href=#334 id=334 data-nosnippet>334</a>
+<a href=#335 id=335 data-nosnippet>335</a>    <span class="comment">// SAFETY: the page is a guest page, mapped for the duration of the guard,
+<a href=#336 id=336 data-nosnippet>336</a>    // and the flags only ever narrow or restore the guest VMPL's own access to
+<a href=#337 id=337 data-nosnippet>337</a>    // it. Nothing here touches SVSM-private mappings, so it cannot affect
+<a href=#338 id=338 data-nosnippet>338</a>    // memory safety on this side.
+<a href=#339 id=339 data-nosnippet>339</a>    // The RMPADJUST status code is kept in the log line rather than folded
+<a href=#340 id=340 data-nosnippet>340</a>    // into the protocol error, which has no field for it. A failed lab run
+<a href=#341 id=341 data-nosnippet>341</a>    // otherwise says only "invalid request" when the interesting part is
+<a href=#342 id=342 data-nosnippet>342</a>    // whether the instruction returned FAIL_PERMISSION, FAIL_SIZEMISMATCH or
+<a href=#343 id=343 data-nosnippet>343</a>    // FAIL_INUSE.
+<a href=#344 id=344 data-nosnippet>344</a>    </span><span class="kw">unsafe </span>{ rmp_adjust(vaddr, flags, PageSize::Regular) }.map_err(|e| <span class="kw">match </span>e {
+<a href=#345 id=345 data-nosnippet>345</a>        SvsmError::SevSnp(code) =&gt; {
+<a href=#346 id=346 data-nosnippet>346</a>            <span class="macro">log::info!</span>(<span class="string">"parttest: RMPADJUST failed on {paddr:#x}, status {code:?}"</span>);
+<a href=#347 id=347 data-nosnippet>347</a>            SvsmReqError::invalid_request()
+<a href=#348 id=348 data-nosnippet>348</a>        }
+<a href=#349 id=349 data-nosnippet>349</a>        other =&gt; other.into(),
+<a href=#350 id=350 data-nosnippet>350</a>    })
+<a href=#351 id=351 data-nosnippet>351</a>}
+<a href=#352 id=352 data-nosnippet>352</a>
+<a href=#353 id=353 data-nosnippet>353</a><span class="kw">fn </span>derived_key_hash(params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#354 id=354 data-nosnippet>354</a>    <span class="kw">let </span>root_key_select =
+<a href=#355 id=355 data-nosnippet>355</a>        u32::try_from(params.rdx).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#356 id=356 data-nosnippet>356</a>    <span class="kw">let </span>request = SnpDerivedKeyRequest::new(root_key_select, params.rcx, <span class="number">0</span>, <span class="number">0</span>)
+<a href=#357 id=357 data-nosnippet>357</a>        .map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#358 id=358 data-nosnippet>358</a>    <span class="kw">let </span>key = get_derived_key(<span class="kw-2">&amp;</span>request).map_err(|e| {
+<a href=#359 id=359 data-nosnippet>359</a>        <span class="macro">log::info!</span>(<span class="string">"parttest: MSG_KEY_REQ failed: {e:?}"</span>);
+<a href=#360 id=360 data-nosnippet>360</a>        SvsmReqError::invalid_request()
+<a href=#361 id=361 data-nosnippet>361</a>    })<span class="question-mark">?</span>;
+<a href=#362 id=362 data-nosnippet>362</a>    <span class="kw">let </span>digest = Sha384::digest(<span class="kw-2">&amp;</span>key[..]);
+<a href=#363 id=363 data-nosnippet>363</a>    <span class="kw">let </span>word = |i: usize| {
+<a href=#364 id=364 data-nosnippet>364</a>        u64::from_le_bytes(
+<a href=#365 id=365 data-nosnippet>365</a>            digest[i * <span class="number">8</span>..i * <span class="number">8 </span>+ <span class="number">8</span>]
+<a href=#366 id=366 data-nosnippet>366</a>                .try_into()
+<a href=#367 id=367 data-nosnippet>367</a>                .expect(<span class="string">"an 8-byte slice of a 48-byte digest"</span>),
+<a href=#368 id=368 data-nosnippet>368</a>        )
+<a href=#369 id=369 data-nosnippet>369</a>    };
+<a href=#370 id=370 data-nosnippet>370</a>    params.rcx = word(<span class="number">0</span>);
+<a href=#371 id=371 data-nosnippet>371</a>    params.rdx = word(<span class="number">1</span>);
+<a href=#372 id=372 data-nosnippet>372</a>    params.r8 = word(<span class="number">2</span>);
+<a href=#373 id=373 data-nosnippet>373</a>    <span class="prelude-val">Ok</span>(())
+<a href=#374 id=374 data-nosnippet>374</a>}
+<a href=#375 id=375 data-nosnippet>375</a>
+<a href=#376 id=376 data-nosnippet>376</a><span class="kw">fn </span>retire_vcpu(params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#377 id=377 data-nosnippet>377</a>    <span class="kw">let </span>vmsa_pa = PhysAddr::from(params.rcx);
+<a href=#378 id=378 data-nosnippet>378</a>    <span class="kw">let </span>list_pa = PhysAddr::from(params.rdx);
+<a href=#379 id=379 data-nosnippet>379</a>    <span class="kw">let </span>deadline = params.r8 &amp; !(<span class="number">1u64 </span>&lt;&lt; <span class="number">63</span>);
+<a href=#380 id=380 data-nosnippet>380</a>    <span class="kw">let </span>opts = RetireOptions {
+<a href=#381 id=381 data-nosnippet>381</a>        inuse_deadline: <span class="kw">if </span>deadline == <span class="number">0 </span>{
+<a href=#382 id=382 data-nosnippet>382</a>            RETIRE_DEFAULT_INUSE_DEADLINE
+<a href=#383 id=383 data-nosnippet>383</a>        } <span class="kw">else </span>{
+<a href=#384 id=384 data-nosnippet>384</a>            deadline
+<a href=#385 id=385 data-nosnippet>385</a>        },
+<a href=#386 id=386 data-nosnippet>386</a>        force: params.r8 &amp; (<span class="number">1u64 </span>&lt;&lt; <span class="number">63</span>) != <span class="number">0</span>,
+<a href=#387 id=387 data-nosnippet>387</a>        log: <span class="bool-val">true</span>,
+<a href=#388 id=388 data-nosnippet>388</a>    };
+<a href=#389 id=389 data-nosnippet>389</a>    params.rcx = <span class="number">0</span>;
+<a href=#390 id=390 data-nosnippet>390</a>    params.rdx = <span class="number">0</span>;
+<a href=#391 id=391 data-nosnippet>391</a>    params.r8 = <span class="number">0</span>;
+<a href=#392 id=392 data-nosnippet>392</a>
+<a href=#393 id=393 data-nosnippet>393</a>    <span class="kw">let </span><span class="kw-2">mut </span>pages: Vec&lt;PhysAddr&gt; = Vec::new();
+<a href=#394 id=394 data-nosnippet>394</a>    <span class="kw">if </span>!list_pa.is_null() {
+<a href=#395 id=395 data-nosnippet>395</a>        <span class="kw">if </span>!list_pa.is_page_aligned() {
+<a href=#396 id=396 data-nosnippet>396</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#397 id=397 data-nosnippet>397</a>        }
+<a href=#398 id=398 data-nosnippet>398</a>        <span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(list_pa)<span class="question-mark">?</span>;
+<a href=#399 id=399 data-nosnippet>399</a>        <span class="kw">let </span>count = guard.guest_ptr::&lt;u64&gt;(<span class="number">0</span>)<span class="question-mark">?</span>.read()<span class="question-mark">?</span>;
+<a href=#400 id=400 data-nosnippet>400</a>        <span class="kw">let </span>count = usize::try_from(count).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#401 id=401 data-nosnippet>401</a>        <span class="kw">if </span>count &gt; RETIRE_MAX_PAGES {
+<a href=#402 id=402 data-nosnippet>402</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#403 id=403 data-nosnippet>403</a>        }
+<a href=#404 id=404 data-nosnippet>404</a>        <span class="kw">let </span>entries = guard.guest_slice::&lt;u64&gt;(<span class="number">8</span>, count)<span class="question-mark">?</span>.read_to_vec()<span class="question-mark">?</span>;
+<a href=#405 id=405 data-nosnippet>405</a>        pages
+<a href=#406 id=406 data-nosnippet>406</a>            .try_reserve_exact(count)
+<a href=#407 id=407 data-nosnippet>407</a>            .map_err(|<span class="kw">_</span>| SvsmReqError::invalid_request())<span class="question-mark">?</span>;
+<a href=#408 id=408 data-nosnippet>408</a>        pages.extend(entries.into_iter().map(PhysAddr::from));
+<a href=#409 id=409 data-nosnippet>409</a>    }
+<a href=#410 id=410 data-nosnippet>410</a>
+<a href=#411 id=411 data-nosnippet>411</a>    <span class="kw">let </span>(res, stats) = <span class="kw">match </span>retire_guest_vcpu(vmsa_pa, <span class="kw-2">&amp;</span>pages, <span class="kw-2">&amp;</span>opts) {
+<a href=#412 id=412 data-nosnippet>412</a>        <span class="prelude-val">Ok</span>(stats) =&gt; (<span class="prelude-val">Ok</span>(()), stats),
+<a href=#413 id=413 data-nosnippet>413</a>        <span class="prelude-val">Err</span>((e, stats)) =&gt; (<span class="prelude-val">Err</span>(e), stats),
+<a href=#414 id=414 data-nosnippet>414</a>    };
+<a href=#415 id=415 data-nosnippet>415</a>    params.rcx = stats.ap_destroy_ticks;
+<a href=#416 id=416 data-nosnippet>416</a>    params.rdx = stats.vmsa_ticks;
+<a href=#417 id=417 data-nosnippet>417</a>    params.r8 = (stats.pages_revoked <span class="kw">as </span>u64 &amp; <span class="number">0xffff</span>)
+<a href=#418 id=418 data-nosnippet>418</a>        | (stats.inuse_retries &amp; <span class="number">0xffff_ffff</span>) &lt;&lt; <span class="number">16
+<a href=#419 id=419 data-nosnippet>419</a>        </span>| u64::from(stats.ap_destroy_refused) &lt;&lt; <span class="number">63</span>;
+<a href=#420 id=420 data-nosnippet>420</a>
+<a href=#421 id=421 data-nosnippet>421</a>    res.map_err(|e| {
+<a href=#422 id=422 data-nosnippet>422</a>        <span class="macro">log::info!</span>(<span class="string">"parttest: retire of VMSA {vmsa_pa:#x} failed: {e:?}"</span>);
+<a href=#423 id=423 data-nosnippet>423</a>        <span class="kw">match </span>e {
+<a href=#424 id=424 data-nosnippet>424</a>            RetireError::InvalidTarget =&gt; SvsmReqError::invalid_parameter(),
+<a href=#425 id=425 data-nosnippet>425</a>            RetireError::InvalidPage(i) =&gt; {
+<a href=#426 id=426 data-nosnippet>426</a>                params.rdx = i <span class="kw">as </span>u64;
+<a href=#427 id=427 data-nosnippet>427</a>                SvsmReqError::invalid_address()
+<a href=#428 id=428 data-nosnippet>428</a>            }
+<a href=#429 id=429 data-nosnippet>429</a>            RetireError::NoMapping =&gt; SvsmReqError::protocol(RETIRE_ERR_NO_MAPPING),
+<a href=#430 id=430 data-nosnippet>430</a>            RetireError::ApDestroy(code) =&gt; {
+<a href=#431 id=431 data-nosnippet>431</a>                params.rdx = code;
+<a href=#432 id=432 data-nosnippet>432</a>                SvsmReqError::protocol(RETIRE_ERR_AP_DESTROY)
+<a href=#433 id=433 data-nosnippet>433</a>            }
+<a href=#434 id=434 data-nosnippet>434</a>            RetireError::Busy(<span class="kw">_</span>) =&gt; SvsmReqError::busy(),
+<a href=#435 id=435 data-nosnippet>435</a>            RetireError::VmsaAdjust(status) =&gt; {
+<a href=#436 id=436 data-nosnippet>436</a>                params.rdx = status;
+<a href=#437 id=437 data-nosnippet>437</a>                SvsmReqError::protocol(RETIRE_ERR_VMSA_ADJUST)
+<a href=#438 id=438 data-nosnippet>438</a>            }
+<a href=#439 id=439 data-nosnippet>439</a>            RetireError::PageRevoke { index, status } =&gt; {
+<a href=#440 id=440 data-nosnippet>440</a>                params.rdx = index <span class="kw">as </span>u64 | status &lt;&lt; <span class="number">32</span>;
+<a href=#441 id=441 data-nosnippet>441</a>                SvsmReqError::protocol(RETIRE_ERR_PAGE_REVOKE)
+<a href=#442 id=442 data-nosnippet>442</a>            }
+<a href=#443 id=443 data-nosnippet>443</a>            RetireError::VmsaRelease(status) =&gt; {
+<a href=#444 id=444 data-nosnippet>444</a>                params.rdx = status;
+<a href=#445 id=445 data-nosnippet>445</a>                SvsmReqError::protocol(RETIRE_ERR_VMSA_RELEASE)
+<a href=#446 id=446 data-nosnippet>446</a>            }
+<a href=#447 id=447 data-nosnippet>447</a>        }
+<a href=#448 id=448 data-nosnippet>448</a>    })
+<a href=#449 id=449 data-nosnippet>449</a>}
+<a href=#450 id=450 data-nosnippet>450</a>
+<a href=#451 id=451 data-nosnippet>451</a><span class="kw">fn </span>start_vcpu(params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#452 id=452 data-nosnippet>452</a>    <span class="kw">let </span>vmsa_pa = PhysAddr::from(params.rcx);
+<a href=#453 id=453 data-nosnippet>453</a>    <span class="kw">let </span>apic_id = params.r8 &amp; <span class="number">0xffff_ffff</span>;
+<a href=#454 id=454 data-nosnippet>454</a>    core_create_vcpu(params)<span class="question-mark">?</span>;
+<a href=#455 id=455 data-nosnippet>455</a>    <span class="kw">let </span>vmpl = <span class="macro">fault_inject!</span>(ApCreate, <span class="kw">_ </span>=&gt; FAULT_BAD_VMPL, RMPFlags::GUEST_VMPL.bits());
+<a href=#456 id=456 data-nosnippet>456</a>    <span class="kw">let </span>sev_features = params.sev_features;
+<a href=#457 id=457 data-nosnippet>457</a>    with_current_ghcb(|ghcb| ghcb.ap_create(vmsa_pa, apic_id, vmpl, sev_features)).map_err(|e| {
+<a href=#458 id=458 data-nosnippet>458</a>        <span class="macro">log::info!</span>(<span class="string">"parttest: AP_CREATE for APIC {apic_id} VMSA {vmsa_pa:#x} failed: {e:?}"</span>);
+<a href=#459 id=459 data-nosnippet>459</a>        <span class="comment">// The documented detail, as call 7 reports a refused AP_DESTROY.
+<a href=#460 id=460 data-nosnippet>460</a>        </span>params.rdx = <span class="kw">match </span>e {
+<a href=#461 id=461 data-nosnippet>461</a>            SvsmError::Ghcb(GhcbError::VmgexitError(info1, <span class="kw">_</span>)) =&gt; info1,
+<a href=#462 id=462 data-nosnippet>462</a>            <span class="kw">_ </span>=&gt; u64::MAX,
+<a href=#463 id=463 data-nosnippet>463</a>        };
+<a href=#464 id=464 data-nosnippet>464</a>        SvsmReqError::protocol(START_ERR_AP_CREATE)
+<a href=#465 id=465 data-nosnippet>465</a>    })
+<a href=#466 id=466 data-nosnippet>466</a>}
+<a href=#467 id=467 data-nosnippet>467</a>
+<a href=#468 id=468 data-nosnippet>468</a><span class="kw">fn </span>fault_inject_call(params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#469 id=469 data-nosnippet>469</a>    <span class="kw">let </span>fault = <span class="kw">match </span>params.rcx &amp; <span class="number">0xfff </span>{
+<a href=#470 id=470 data-nosnippet>470</a>        <span class="number">0 </span>=&gt; <span class="prelude-val">None</span>,
+<a href=#471 id=471 data-nosnippet>471</a>        code =&gt; {
+<a href=#472 id=472 data-nosnippet>472</a>            <span class="kw">let </span>step = FaultStep::from_code(code).ok_or_else(SvsmReqError::invalid_parameter)<span class="question-mark">?</span>;
+<a href=#473 id=473 data-nosnippet>473</a>            <span class="kw">let </span>count = (params.r8 &gt;&gt; <span class="number">32</span>) <span class="kw">as </span>u32;
+<a href=#474 id=474 data-nosnippet>474</a>            <span class="prelude-val">Some</span>(Fault {
+<a href=#475 id=475 data-nosnippet>475</a>                step,
+<a href=#476 id=476 data-nosnippet>476</a>                value: params.rdx,
+<a href=#477 id=477 data-nosnippet>477</a>                skip: params.r8 <span class="kw">as </span>u32,
+<a href=#478 id=478 data-nosnippet>478</a>                count: count.max(<span class="number">1</span>),
+<a href=#479 id=479 data-nosnippet>479</a>                key: params.rcx &amp; !<span class="number">0xfff</span>,
+<a href=#480 id=480 data-nosnippet>480</a>            })
+<a href=#481 id=481 data-nosnippet>481</a>        }
+<a href=#482 id=482 data-nosnippet>482</a>    };
+<a href=#483 id=483 data-nosnippet>483</a>    <span class="kw">let </span>prev = fault_arm(fault);
+<a href=#484 id=484 data-nosnippet>484</a>    <span class="kw">if let </span><span class="prelude-val">Some</span>(f) = fault {
+<a href=#485 id=485 data-nosnippet>485</a>        <span class="macro">log::info!</span>(
+<a href=#486 id=486 data-nosnippet>486</a>            <span class="string">"parttest: fault armed at {:?}, value {:#x}, skip {}, count {}, key {:#x}"</span>,
+<a href=#487 id=487 data-nosnippet>487</a>            f.step,
+<a href=#488 id=488 data-nosnippet>488</a>            f.value,
+<a href=#489 id=489 data-nosnippet>489</a>            f.skip,
+<a href=#490 id=490 data-nosnippet>490</a>            f.count,
+<a href=#491 id=491 data-nosnippet>491</a>            f.key
+<a href=#492 id=492 data-nosnippet>492</a>        );
+<a href=#493 id=493 data-nosnippet>493</a>    }
+<a href=#494 id=494 data-nosnippet>494</a>    params.rcx = prev.step;
+<a href=#495 id=495 data-nosnippet>495</a>    params.rdx = prev.fired;
+<a href=#496 id=496 data-nosnippet>496</a>    params.r8 = u64::from(prev.remaining);
+<a href=#497 id=497 data-nosnippet>497</a>    <span class="prelude-val">Ok</span>(())
+<a href=#498 id=498 data-nosnippet>498</a>}
+<a href=#499 id=499 data-nosnippet>499</a>
+<a href=#500 id=500 data-nosnippet>500</a><span class="kw">fn </span>watchdog_err(e: WatchdogError, params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; SvsmReqError {
+<a href=#501 id=501 data-nosnippet>501</a>    <span class="kw">match </span>e {
+<a href=#502 id=502 data-nosnippet>502</a>        WatchdogError::BadPage(i) =&gt; {
+<a href=#503 id=503 data-nosnippet>503</a>            params.rdx = i <span class="kw">as </span>u64;
+<a href=#504 id=504 data-nosnippet>504</a>            SvsmReqError::invalid_address()
+<a href=#505 id=505 data-nosnippet>505</a>        }
+<a href=#506 id=506 data-nosnippet>506</a>        WatchdogError::BadHeartbeat =&gt; SvsmReqError::invalid_address(),
+<a href=#507 id=507 data-nosnippet>507</a>        WatchdogError::Read(err) =&gt; {
+<a href=#508 id=508 data-nosnippet>508</a>            <span class="macro">log::info!</span>(<span class="string">"parttest: watchdog heartbeat read failed: {err:?}"</span>);
+<a href=#509 id=509 data-nosnippet>509</a>            SvsmReqError::invalid_address()
+<a href=#510 id=510 data-nosnippet>510</a>        }
+<a href=#511 id=511 data-nosnippet>511</a>        WatchdogError::BadTarget | WatchdogError::TooManyPages | WatchdogError::BadSlot =&gt; {
+<a href=#512 id=512 data-nosnippet>512</a>            SvsmReqError::invalid_parameter()
+<a href=#513 id=513 data-nosnippet>513</a>        }
+<a href=#514 id=514 data-nosnippet>514</a>        WatchdogError::AlreadyWatched =&gt; SvsmReqError::protocol(WATCHDOG_ERR_ALREADY_WATCHED),
+<a href=#515 id=515 data-nosnippet>515</a>        WatchdogError::Full =&gt; SvsmReqError::protocol(WATCHDOG_ERR_FULL),
+<a href=#516 id=516 data-nosnippet>516</a>        WatchdogError::NotWatchdogCpu =&gt; SvsmReqError::protocol(WATCHDOG_ERR_NOT_WATCHDOG_CPU),
+<a href=#517 id=517 data-nosnippet>517</a>    }
+<a href=#518 id=518 data-nosnippet>518</a>}
+<a href=#519 id=519 data-nosnippet>519</a>
+<a href=#520 id=520 data-nosnippet>520</a><span class="kw">fn </span>watchdog_arm_call(params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#521 id=521 data-nosnippet>521</a>    <span class="kw">let </span>req_pa = PhysAddr::from(params.rcx);
+<a href=#522 id=522 data-nosnippet>522</a>    <span class="kw">if </span>!req_pa.is_page_aligned() {
+<a href=#523 id=523 data-nosnippet>523</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#524 id=524 data-nosnippet>524</a>    }
+<a href=#525 id=525 data-nosnippet>525</a>    <span class="kw">let </span>(vmsa_pa, hb_pa, deadline, pages) = {
+<a href=#526 id=526 data-nosnippet>526</a>        <span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(req_pa)<span class="question-mark">?</span>;
+<a href=#527 id=527 data-nosnippet>527</a>        <span class="kw">let </span>head = guard.guest_slice::&lt;u64&gt;(<span class="number">0</span>, <span class="number">4</span>)<span class="question-mark">?</span>.read_to_vec()<span class="question-mark">?</span>;
+<a href=#528 id=528 data-nosnippet>528</a>        <span class="kw">let </span>count = usize::try_from(head[<span class="number">3</span>]).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#529 id=529 data-nosnippet>529</a>        <span class="kw">if </span>count &gt; WATCHDOG_MAX_PAGES {
+<a href=#530 id=530 data-nosnippet>530</a>            <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#531 id=531 data-nosnippet>531</a>        }
+<a href=#532 id=532 data-nosnippet>532</a>        <span class="kw">let </span>pages = guard.guest_slice::&lt;u64&gt;(<span class="number">32</span>, count)<span class="question-mark">?</span>.read_to_vec()<span class="question-mark">?</span>;
+<a href=#533 id=533 data-nosnippet>533</a>        (head[<span class="number">0</span>], head[<span class="number">1</span>], head[<span class="number">2</span>], pages)
+<a href=#534 id=534 data-nosnippet>534</a>    };
+<a href=#535 id=535 data-nosnippet>535</a>    <span class="kw">let </span>pages: Vec&lt;PhysAddr&gt; = pages.into_iter().map(PhysAddr::from).collect();
+<a href=#536 id=536 data-nosnippet>536</a>    <span class="kw">let </span>policy = <span class="kw">if </span>params.rdx &amp; ARM_POLICY_SET != <span class="number">0 </span>{
+<a href=#537 id=537 data-nosnippet>537</a>        RetryPolicy {
+<a href=#538 id=538 data-nosnippet>538</a>            retries: params.rdx <span class="kw">as </span>u16,
+<a href=#539 id=539 data-nosnippet>539</a>            window: params.r8,
+<a href=#540 id=540 data-nosnippet>540</a>            force: params.rdx &amp; ARM_POLICY_NO_FORCE == <span class="number">0</span>,
+<a href=#541 id=541 data-nosnippet>541</a>        }
+<a href=#542 id=542 data-nosnippet>542</a>    } <span class="kw">else </span>{
+<a href=#543 id=543 data-nosnippet>543</a>        RetryPolicy::default()
+<a href=#544 id=544 data-nosnippet>544</a>    };
+<a href=#545 id=545 data-nosnippet>545</a>    params.rdx = <span class="number">0</span>;
+<a href=#546 id=546 data-nosnippet>546</a>    <span class="kw">let </span>slot = watchdog_arm(
+<a href=#547 id=547 data-nosnippet>547</a>        PhysAddr::from(vmsa_pa),
+<a href=#548 id=548 data-nosnippet>548</a>        PhysAddr::from(hb_pa),
+<a href=#549 id=549 data-nosnippet>549</a>        deadline,
+<a href=#550 id=550 data-nosnippet>550</a>        pages,
+<a href=#551 id=551 data-nosnippet>551</a>        policy,
+<a href=#552 id=552 data-nosnippet>552</a>    )
+<a href=#553 id=553 data-nosnippet>553</a>    .map_err(|e| watchdog_err(e, params))<span class="question-mark">?</span>;
+<a href=#554 id=554 data-nosnippet>554</a>    params.rcx = slot <span class="kw">as </span>u64;
+<a href=#555 id=555 data-nosnippet>555</a>    <span class="prelude-val">Ok</span>(())
+<a href=#556 id=556 data-nosnippet>556</a>}
+<a href=#557 id=557 data-nosnippet>557</a>
+<a href=#558 id=558 data-nosnippet>558</a><span class="kw">fn </span>watchdog_tick_call(params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#559 id=559 data-nosnippet>559</a>    <span class="kw">let </span>report = watchdog_tick().map_err(|e| watchdog_err(e, params))<span class="question-mark">?</span>;
+<a href=#560 id=560 data-nosnippet>560</a>    params.rcx = u64::from(report.checked);
+<a href=#561 id=561 data-nosnippet>561</a>    params.rdx = report.reclaimed;
+<a href=#562 id=562 data-nosnippet>562</a>    params.r8 = (report.ticks &amp; <span class="number">0xffff_ffff</span>) | report.failed &lt;&lt; <span class="number">32 </span>| report.retrying &lt;&lt; <span class="number">48</span>;
+<a href=#563 id=563 data-nosnippet>563</a>    <span class="prelude-val">Ok</span>(())
+<a href=#564 id=564 data-nosnippet>564</a>}
+<a href=#565 id=565 data-nosnippet>565</a>
+<a href=#566 id=566 data-nosnippet>566</a><span class="doccomment">/// A retire error as status words carry it: code &lt;&lt; 8 | detail &lt;&lt; 32.
+<a href=#567 id=567 data-nosnippet>567</a></span><span class="kw">fn </span>retire_error_code(e: RetireError) -&gt; u64 {
+<a href=#568 id=568 data-nosnippet>568</a>    <span class="kw">let </span>(code, detail): (u64, u64) = <span class="kw">match </span>e {
+<a href=#569 id=569 data-nosnippet>569</a>        RetireError::InvalidTarget =&gt; (<span class="number">1</span>, <span class="number">0</span>),
+<a href=#570 id=570 data-nosnippet>570</a>        RetireError::InvalidPage(i) =&gt; (<span class="number">2</span>, i <span class="kw">as </span>u64),
+<a href=#571 id=571 data-nosnippet>571</a>        RetireError::NoMapping =&gt; (<span class="number">3</span>, <span class="number">0</span>),
+<a href=#572 id=572 data-nosnippet>572</a>        RetireError::ApDestroy(c) =&gt; (<span class="number">4</span>, c),
+<a href=#573 id=573 data-nosnippet>573</a>        RetireError::Busy(r) =&gt; (<span class="number">5</span>, r),
+<a href=#574 id=574 data-nosnippet>574</a>        RetireError::VmsaAdjust(s) =&gt; (<span class="number">6</span>, s),
+<a href=#575 id=575 data-nosnippet>575</a>        RetireError::PageRevoke { index, status } =&gt; (<span class="number">7</span>, index <span class="kw">as </span>u64 | status &lt;&lt; <span class="number">16</span>),
+<a href=#576 id=576 data-nosnippet>576</a>        RetireError::VmsaRelease(s) =&gt; (<span class="number">8</span>, s),
+<a href=#577 id=577 data-nosnippet>577</a>    };
+<a href=#578 id=578 data-nosnippet>578</a>    code &lt;&lt; <span class="number">8 </span>| (detail &amp; <span class="number">0xffff_ffff</span>) &lt;&lt; <span class="number">32
+<a href=#579 id=579 data-nosnippet>579</a></span>}
+<a href=#580 id=580 data-nosnippet>580</a>
+<a href=#581 id=581 data-nosnippet>581</a><span class="doccomment">/// Bits 0-7 the state, and for the states that carry an error, that error as
+<a href=#582 id=582 data-nosnippet>582</a>/// `retire_error_code` lays it out. Retrying sets bit 16 when the next
+<a href=#583 id=583 data-nosnippet>583</a>/// attempt is forced.
+<a href=#584 id=584 data-nosnippet>584</a></span><span class="kw">fn </span>slot_state_code(state: SlotState, force_next: bool) -&gt; u64 {
+<a href=#585 id=585 data-nosnippet>585</a>    <span class="kw">match </span>state {
+<a href=#586 id=586 data-nosnippet>586</a>        SlotState::Free =&gt; <span class="number">0</span>,
+<a href=#587 id=587 data-nosnippet>587</a>        SlotState::Armed =&gt; <span class="number">1</span>,
+<a href=#588 id=588 data-nosnippet>588</a>        SlotState::Reclaiming =&gt; <span class="number">2</span>,
+<a href=#589 id=589 data-nosnippet>589</a>        SlotState::Reclaimed =&gt; <span class="number">3</span>,
+<a href=#590 id=590 data-nosnippet>590</a>        SlotState::Failed(e) =&gt; <span class="number">4 </span>| retire_error_code(e),
+<a href=#591 id=591 data-nosnippet>591</a>        SlotState::Retrying(e) =&gt; <span class="number">5 </span>| retire_error_code(e) | u64::from(force_next) &lt;&lt; <span class="number">16</span>,
+<a href=#592 id=592 data-nosnippet>592</a>        SlotState::ReclaimedPartly(e) =&gt; <span class="number">6 </span>| retire_error_code(e),
+<a href=#593 id=593 data-nosnippet>593</a>    }
+<a href=#594 id=594 data-nosnippet>594</a>}
+<a href=#595 id=595 data-nosnippet>595</a>
+<a href=#596 id=596 data-nosnippet>596</a><span class="kw">fn </span>watchdog_status_call(params: <span class="kw-2">&amp;mut </span>RequestParams) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#597 id=597 data-nosnippet>597</a>    <span class="kw">let </span>index = usize::try_from(params.rcx).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#598 id=598 data-nosnippet>598</a>    <span class="kw">let </span>out_pa = PhysAddr::from(params.rdx);
+<a href=#599 id=599 data-nosnippet>599</a>    <span class="kw">if </span>!out_pa.is_page_aligned() {
+<a href=#600 id=600 data-nosnippet>600</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(SvsmReqError::invalid_parameter());
+<a href=#601 id=601 data-nosnippet>601</a>    }
+<a href=#602 id=602 data-nosnippet>602</a>    <span class="kw">let </span>s = watchdog_status(index).map_err(|e| watchdog_err(e, params))<span class="question-mark">?</span>;
+<a href=#603 id=603 data-nosnippet>603</a>    <span class="kw">let </span>words: [u64; WATCHDOG_STATUS_WORDS] = [
+<a href=#604 id=604 data-nosnippet>604</a>        slot_state_code(s.state, s.force_next),
+<a href=#605 id=605 data-nosnippet>605</a>        u64::from(s.vmsa_pa),
+<a href=#606 id=606 data-nosnippet>606</a>        s.cpu_index <span class="kw">as </span>u64,
+<a href=#607 id=607 data-nosnippet>607</a>        s.deadline,
+<a href=#608 id=608 data-nosnippet>608</a>        s.last_value,
+<a href=#609 id=609 data-nosnippet>609</a>        s.last_change,
+<a href=#610 id=610 data-nosnippet>610</a>        s.armed_at,
+<a href=#611 id=611 data-nosnippet>611</a>        s.changes_seen,
+<a href=#612 id=612 data-nosnippet>612</a>        s.max_gap,
+<a href=#613 id=613 data-nosnippet>613</a>        s.read_errors,
+<a href=#614 id=614 data-nosnippet>614</a>        s.reclaim_decided,
+<a href=#615 id=615 data-nosnippet>615</a>        s.stale_at_reclaim,
+<a href=#616 id=616 data-nosnippet>616</a>        s.retire.ap_destroy_ticks,
+<a href=#617 id=617 data-nosnippet>617</a>        s.retire.lock_ticks,
+<a href=#618 id=618 data-nosnippet>618</a>        s.retire.vmsa_ticks,
+<a href=#619 id=619 data-nosnippet>619</a>        s.retire.total_ticks,
+<a href=#620 id=620 data-nosnippet>620</a>        s.retire.pages_revoked <span class="kw">as </span>u64 | s.retire.inuse_retries &lt;&lt; <span class="number">16</span>,
+<a href=#621 id=621 data-nosnippet>621</a>        s.watchdog_ticks,
+<a href=#622 id=622 data-nosnippet>622</a>        s.last_tick,
+<a href=#623 id=623 data-nosnippet>623</a>        rdtsc(),
+<a href=#624 id=624 data-nosnippet>624</a>        s.retire_started,
+<a href=#625 id=625 data-nosnippet>625</a>        s.max_still,
+<a href=#626 id=626 data-nosnippet>626</a>        <span class="comment">// 22: retries | an attempt used force &lt;&lt; 32 | the host refused
+<a href=#627 id=627 data-nosnippet>627</a>        // AP_DESTROY on the last attempt &lt;&lt; 33.
+<a href=#628 id=628 data-nosnippet>628</a>        </span>u64::from(s.retries)
+<a href=#629 id=629 data-nosnippet>629</a>            | u64::from(s.forced) &lt;&lt; <span class="number">32
+<a href=#630 id=630 data-nosnippet>630</a>            </span>| u64::from(s.retire.ap_destroy_refused) &lt;&lt; <span class="number">33</span>,
+<a href=#631 id=631 data-nosnippet>631</a>        <span class="comment">// 23: the policy as ARM takes it.
+<a href=#632 id=632 data-nosnippet>632</a>        </span>ARM_POLICY_SET
+<a href=#633 id=633 data-nosnippet>633</a>            | u64::from(s.policy.retries)
+<a href=#634 id=634 data-nosnippet>634</a>            | <span class="kw">if </span>s.policy.force {
+<a href=#635 id=635 data-nosnippet>635</a>                <span class="number">0
+<a href=#636 id=636 data-nosnippet>636</a>            </span>} <span class="kw">else </span>{
+<a href=#637 id=637 data-nosnippet>637</a>                ARM_POLICY_NO_FORCE
+<a href=#638 id=638 data-nosnippet>638</a>            },
+<a href=#639 id=639 data-nosnippet>639</a>        <span class="comment">// 24: retry window, TSC ticks.
+<a href=#640 id=640 data-nosnippet>640</a>        </span>s.policy.window,
+<a href=#641 id=641 data-nosnippet>641</a>        <span class="comment">// 25: first failed attempt's error, 0 if none.
+<a href=#642 id=642 data-nosnippet>642</a>        </span>s.first_error.map_or(<span class="number">0</span>, retire_error_code),
+<a href=#643 id=643 data-nosnippet>643</a>    ];
+<a href=#644 id=644 data-nosnippet>644</a>    <span class="kw">let </span>guard = PerCPUPageMappingGuard::create_4k(out_pa)<span class="question-mark">?</span>;
+<a href=#645 id=645 data-nosnippet>645</a>    guard
+<a href=#646 id=646 data-nosnippet>646</a>        .guest_slice::&lt;u64&gt;(<span class="number">0</span>, WATCHDOG_STATUS_WORDS)<span class="question-mark">?
+<a href=#647 id=647 data-nosnippet>647</a>        </span>.write_from_slice(<span class="kw-2">&amp;</span>words)<span class="question-mark">?</span>;
+<a href=#648 id=648 data-nosnippet>648</a>    <span class="prelude-val">Ok</span>(())
+<a href=#649 id=649 data-nosnippet>649</a>}
+<a href=#650 id=650 data-nosnippet>650</a>
+<a href=#651 id=651 data-nosnippet>651</a><span class="kw">pub fn </span>parttest_protocol_request(
+<a href=#652 id=652 data-nosnippet>652</a>    request: u32,
+<a href=#653 id=653 data-nosnippet>653</a>    params: <span class="kw-2">&amp;mut </span>RequestParams,
+<a href=#654 id=654 data-nosnippet>654</a>) -&gt; <span class="prelude-ty">Result</span>&lt;(), SvsmReqError&gt; {
+<a href=#655 id=655 data-nosnippet>655</a>    <span class="kw">match </span>request {
+<a href=#656 id=656 data-nosnippet>656</a>        <span class="comment">// These touch GUEST_VMPL alone, where upstream's
+<a href=#657 id=657 data-nosnippet>657</a>        // rmp_revoke_guest_access sweeps GUEST_VMPL through VMPL3. Deliberate:
+<a href=#658 id=658 data-nosnippet>658</a>        // the test is about what the partition's own VMPL can reach, and
+<a href=#659 id=659 data-nosnippet>659</a>        // narrowing one level is what idea B does on a switch. Sweeping the
+<a href=#660 id=660 data-nosnippet>660</a>        // rest would also revoke levels the test never granted, which would
+<a href=#661 id=661 data-nosnippet>661</a>        // make a failure harder to attribute rather than easier.
+<a href=#662 id=662 data-nosnippet>662</a>        </span>SVSM_REQ_PARTTEST_REVOKE_WRITE =&gt; {
+<a href=#663 id=663 data-nosnippet>663</a>            adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::READ)
+<a href=#664 id=664 data-nosnippet>664</a>        }
+<a href=#665 id=665 data-nosnippet>665</a>        SVSM_REQ_PARTTEST_GRANT_WRITE =&gt; {
+<a href=#666 id=666 data-nosnippet>666</a>            adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::RWX)
+<a href=#667 id=667 data-nosnippet>667</a>        }
+<a href=#668 id=668 data-nosnippet>668</a>        SVSM_REQ_PARTTEST_REVOKE_ALL =&gt; {
+<a href=#669 id=669 data-nosnippet>669</a>            adjust_guest_page(params, RMPFlags::GUEST_VMPL | RMPFlags::NONE)
+<a href=#670 id=670 data-nosnippet>670</a>        }
+<a href=#671 id=671 data-nosnippet>671</a>        SVSM_REQ_PARTTEST_NOOP =&gt; <span class="prelude-val">Ok</span>(()),
+<a href=#672 id=672 data-nosnippet>672</a>        SVSM_REQ_PARTTEST_DERIVED_KEY_HASH =&gt; derived_key_hash(params),
+<a href=#673 id=673 data-nosnippet>673</a>        SVSM_REQ_PARTTEST_RETIRE_VCPU =&gt; retire_vcpu(params),
+<a href=#674 id=674 data-nosnippet>674</a>        SVSM_REQ_PARTTEST_START_VCPU =&gt; start_vcpu(params),
+<a href=#675 id=675 data-nosnippet>675</a>        SVSM_REQ_PARTTEST_WATCHDOG_ARM =&gt; watchdog_arm_call(params),
+<a href=#676 id=676 data-nosnippet>676</a>        SVSM_REQ_PARTTEST_WATCHDOG_TICK =&gt; watchdog_tick_call(params),
+<a href=#677 id=677 data-nosnippet>677</a>        SVSM_REQ_PARTTEST_WATCHDOG_STATUS =&gt; watchdog_status_call(params),
+<a href=#678 id=678 data-nosnippet>678</a>        SVSM_REQ_PARTTEST_WATCHDOG_DISARM =&gt; {
+<a href=#679 id=679 data-nosnippet>679</a>            <span class="kw">let </span>index =
+<a href=#680 id=680 data-nosnippet>680</a>                usize::try_from(params.rcx).map_err(|<span class="kw">_</span>| SvsmReqError::invalid_parameter())<span class="question-mark">?</span>;
+<a href=#681 id=681 data-nosnippet>681</a>            watchdog_disarm(index).map_err(|e| watchdog_err(e, params))
+<a href=#682 id=682 data-nosnippet>682</a>        }
+<a href=#683 id=683 data-nosnippet>683</a>        SVSM_REQ_PARTTEST_FAULT_INJECT =&gt; fault_inject_call(params),
+<a href=#684 id=684 data-nosnippet>684</a>        <span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#685 id=685 data-nosnippet>685</a>        </span>SVSM_REQ_PARTTEST_DICE_ROOT =&gt; dice_root(params),
+<a href=#686 id=686 data-nosnippet>686</a>        <span class="attr">#[cfg(feature = <span class="string">"dice"</span>)]
+<a href=#687 id=687 data-nosnippet>687</a>        </span>SVSM_REQ_PARTTEST_DICE_ATTEST =&gt; dice_attest(params),
+<a href=#688 id=688 data-nosnippet>688</a>        <span class="kw">_ </span>=&gt; <span class="prelude-val">Err</span>(SvsmReqError::unsupported_call()),
+<a href=#689 id=689 data-nosnippet>689</a>    }
+<a href=#690 id=690 data-nosnippet>690</a>}</code></pre></div></section></main></body></html>

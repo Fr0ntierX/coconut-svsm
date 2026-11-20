@@ -1,0 +1,41 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Retire a guest vCPU at the guest VMPL, then revoke a partition’s pages."><title>retire_guest_vcpu in svsm::protocols::core - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2" crossorigin href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1a91846b.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="svsm" data-themes="" data-resource-suffix="" data-rustdoc-version="1.88.0 (6b00bc388 2025-06-23)" data-channel="1.88.0" data-search-js="search-f7877310.js" data-settings-js="settings-5514c975.js" ><script src="../../../static.files/storage-4e99c027.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../../static.files/main-7ef8a74a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-893ab5e7.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-6580c154.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="mobile-topbar"><button class="sidebar-menu-toggle" title="show sidebar"></button></nav><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../svsm/index.html">svsm</a><span class="version">0.1.0</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In svsm::<wbr>protocols::<wbr>core</a></h2></div></div></nav><div class="sidebar-resizer"></div><main><div class="width-limiter"><rustdoc-search></rustdoc-search><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">svsm</a>::<wbr><a href="../index.html">protocols</a>::<wbr><a href="index.html">core</a></div><h1>Function <span class="fn">retire_guest_vcpu</span><button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/svsm/protocols/core.rs.html#386-399">Source</a> </span></div><pre class="rust item-decl"><code>pub(crate) fn retire_guest_vcpu(
+    vmsa_pa: <a class="struct" href="../../address/struct.PhysAddr.html" title="struct svsm::address::PhysAddr">PhysAddr</a>,
+    pages: &amp;[<a class="struct" href="../../address/struct.PhysAddr.html" title="struct svsm::address::PhysAddr">PhysAddr</a>],
+    opts: &amp;<a class="struct" href="struct.RetireOptions.html" title="struct svsm::protocols::core::RetireOptions">RetireOptions</a>,
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.88.0/core/result/enum.Result.html" title="enum core::result::Result">Result</a>&lt;<a class="struct" href="struct.RetireStats.html" title="struct svsm::protocols::core::RetireStats">RetireStats</a>, (<a class="enum" href="enum.RetireError.html" title="enum svsm::protocols::core::RetireError">RetireError</a>, <a class="struct" href="struct.RetireStats.html" title="struct svsm::protocols::core::RetireStats">RetireStats</a>)&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Retire a guest vCPU at the guest VMPL, then revoke a partition’s pages.</p>
+<p>This is the reclaim step of the CMVM watchdog (uPolaris threat model
+section 9.3). Steps, in order:</p>
+<ol>
+<li>Check the target is a guest-created, in-use VMSA that is not the
+calling vCPU’s, and that every page in <code>pages</code> is a 4K guest page that
+is not a registered VMSA or calling area.</li>
+<li>GHCB AP_DESTROY for the target’s APIC ID at the guest VMPL, before
+taking <code>PVALIDATE_LOCK</code>, so the host’s kick has time to land. Without
+it the retire still works but KVM is not told, and the VM stops at the
+target’s next VMRUN (measured on the lab part, 16 Nov 2026).</li>
+<li>Under <code>PVALIDATE_LOCK</code>, RMPADJUST the VMSA page to no access at the
+guest VMPL, which clears the VMSA attribute. Success is the hardware
+proof that the vCPU is out of guest mode and can never re-enter. The
+APM allows FAIL_INUSE here, which is retried until
+<code>opts.inuse_deadline</code>. On the parts we have measured the hardware never
+returns it: while the target is in guest mode the instruction raises a
+nested page fault on the VMSA page, the host resumes it, and it runs
+again. VMPL0 never regains control during that loop, so its length is
+set by the host (about 7 us when the AP_DESTROY kick lands, about
+0.8 ms when it misses and the target waits for its next timer exit).
+A hostile host can stretch it, which is denial of service.</li>
+<li>Unregister the VMSA, revoke every guest VMPL’s access to each page in
+<code>pages</code>, then zero the old VMSA page and give it back to the guest VMPL
+as <code>core_delete_vcpu</code> does. Scrubbing anything the vCPU held is only
+safe after step 3, never after the AP_DESTROY return.</li>
+</ol>
+<p>The guest kernel must have taken the target CPU offline. An NMI sent to a
+retired vCPU makes KVM refuse to run it and stops the VM, and the other
+CPUs wedge waiting on it otherwise.</p>
+<p>Partition pages are revoked at 4K. A page the guest validated as part of
+a 2M RMP entry returns FAIL_SIZEMISMATCH and is reported as
+<a href="enum.RetireError.html#variant.PageRevoke" title="variant svsm::protocols::core::RetireError::PageRevoke"><code>RetireError::PageRevoke</code></a>.</p>
+<p>The stats come back with the error too, filled in as far as the call got.
+The watchdog (<code>protocols::watchdog</code>) calls it when a watched vCPU misses
+its deadline.</p>
+</div></details></section></div></main></body></html>

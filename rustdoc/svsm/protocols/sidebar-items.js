@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SVSM_APIC_PROTOCOL","SVSM_ATTEST_PROTOCOL","SVSM_CORE_PROTOCOL","SVSM_OBSERVABILITY_CONFIGURATION_PROTOCOL","SVSM_PARTTEST_PROTOCOL","SVSM_UEFI_MM_PROTOCOL","SVSM_VTPM_PROTOCOL"],"macro":["fault_inject"],"mod":["apic","attest","core","errors","faultinj","parttest","uefivars","vtpm","watchdog"],"struct":["RequestOutput","RequestParams"]};

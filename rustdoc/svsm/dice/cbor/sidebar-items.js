@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ARRAY","BYTES","MAP","NINT","TEXT","UINT"],"fn":["array","bytes","head","int","map","text"]};
